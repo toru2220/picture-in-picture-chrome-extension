@@ -12,53 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-function findLargestPlayingVideo() {
-  const videos = Array.from(document.querySelectorAll('video'))
-    .filter(video => video.readyState != 0)
-    .filter(video => video.disablePictureInPicture == false)
-    .sort((v1, v2) => {
-      const v1Rect = v1.getClientRects()[0]||{width:0,height:0};
-      const v2Rect = v2.getClientRects()[0]||{width:0,height:0};
-      return ((v2Rect.width * v2Rect.height) - (v1Rect.width * v1Rect.height));
-    });
-
-  if (videos.length === 0) {
-    return;
-  }
-
-  return videos[0];
-}
-
-async function requestPictureInPicture(video) {
-  await video.requestPictureInPicture();
-  video.setAttribute('__pip__', true);
-  video.addEventListener('leavepictureinpicture', event => {
-    video.removeAttribute('__pip__');
-  }, { once: true });
-  new ResizeObserver(maybeUpdatePictureInPictureVideo).observe(video);
-}
-
-function maybeUpdatePictureInPictureVideo(entries, observer) {
-  const observedVideo = entries[0].target;
-  if (!document.querySelector('[__pip__]')) {
-    observer.unobserve(observedVideo);
-    return;
-  }
-  const video = findLargestPlayingVideo();
-  if (video && !video.hasAttribute('__pip__')) {
-    observer.unobserve(observedVideo);
-    requestPictureInPicture(video);
-  }
-}
-
 (async () => {
+  installPipWatcher();
   const video = findLargestPlayingVideo();
-  if (!video) {
+  if (video && needsNativePip(video)) {
+    if (extensionPipOpen() && !documentPipWindow()) {
+      exitExtensionPip();
+      return;
+    }
+    await presentNativePip(video);
     return;
   }
-  if (video.hasAttribute('__pip__')) {
-    document.exitPictureInPicture();
+  const status = await pipSend({ type: 'pip-status' });
+  if (status && status.isGuest) {
+    if (pipState().guestActive) stopGuestTile(false);
     return;
   }
-  await requestPictureInPicture(video);
+  // Exit whenever this document is already in PiP. The session may have moved
+  // to a different element than the largest one on the page.
+  if (extensionPipOpen()) {
+    exitExtensionPip();
+    return;
+  }
+  if (!video) return;
+  if (!isTopFrame()) {
+    if (status && status.hostTabId != null && !status.isHost) {
+      await startGuestTile(video);
+      return;
+    }
+    if (status && status.hostTabId != null) return;
+    await requestPictureInPicture(video);
+    return;
+  }
+  if (status && status.hostTabId != null && !status.isHost) {
+    await startGuestTile(video);
+    return;
+  }
+  const claim = await claimPipHost();
+  if (claim && !claim.ok) {
+    if (!claim.sameTab) await startGuestTile(video);
+    return;
+  }
+  try {
+    await requestPictureInPicture(video);
+  } finally {
+    if (pipState().hostClaimed && documentPipWindow()) {
+      connectPipPort();
+      flushPendingGuests();
+    } else if (pipState().hostClaimed) {
+      releasePipHost();
+    }
+  }
 })();

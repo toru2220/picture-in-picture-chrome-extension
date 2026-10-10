@@ -12,27 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-function findLargestPlayingVideo() {
-  const videos = Array.from(document.querySelectorAll("video"))
-    .filter((video) => video.readyState != 0)
-    .filter((video) => video.disablePictureInPicture == false)
-    .sort((v1, v2) => {
-      const v1Rect = v1.getClientRects()[0] || { width: 0, height: 0 };
-      const v2Rect = v2.getClientRects()[0] || { width: 0, height: 0 };
-      return v2Rect.width * v2Rect.height - v1Rect.width * v1Rect.height;
-    });
-
-  if (videos.length === 0) {
-    return;
-  }
-
-  return videos[0];
-}
+installPipWatcher();
 
 // Request video to automatically enter picture-in-picture when eligible.
-navigator.mediaSession.setActionHandler("enterpictureinpicture", () => {
+// Another tab's tiled window stays as it is. A video that cannot move into
+// Document PiP closes every open PiP window and uses the browser's own PiP.
+navigator.mediaSession.setActionHandler("enterpictureinpicture", async () => {
   const video = findLargestPlayingVideo();
-  if (video) {
-    video.requestPictureInPicture();
+  if (video && needsNativePip(video)) {
+    if (extensionPipOpen() && !documentPipWindow()) return;
+    await presentNativePip(video);
+    return;
+  }
+  if (pipState().guestActive) return;
+  const status = await pipSend({ type: 'pip-status' });
+  if (status && ((status.hostTabId != null && !status.isHost) || status.isGuest)) return;
+  if (!video) return;
+  if (!isTopFrame()) {
+    if (status && status.hostTabId != null) return;
+    return requestPictureInPicture(video);
+  }
+  if (status && status.isHost && documentPipWindow()) return;
+  const claim = await claimPipHost();
+  if (claim && !claim.ok) return;
+  try {
+    return await requestPictureInPicture(video);
+  } finally {
+    if (pipState().hostClaimed && documentPipWindow()) {
+      connectPipPort();
+      flushPendingGuests();
+    } else if (pipState().hostClaimed) {
+      releasePipHost();
+    }
   }
 });
