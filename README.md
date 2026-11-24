@@ -11,3 +11,17 @@ Get it on the Chrome Web Store at https://chrome.google.com/webstore/detail/hkgf
 The keyboard shortcut (defaults to `Alt-P`) can be changed on the
 Chrome Extension Shortcuts settings page:
 chrome://extensions/shortcuts
+
+## Playback speed
+
+The shortcuts below match Video Speed Controller. They adjust the video on
+the page, and they keep working inside the Picture-in-Picture window. The
+window also has − / + buttons and a speed readout; click the readout to reset.
+A speed you set is applied again when the player loads the next video.
+
+- `S` / `D` — slower / faster by 0.1×. Crossing 1× snaps to 1×.
+- `R` — reset to 1×. Press again to restore the previous speed.
+- `G` — preferred speed, 1.8×. Press again to restore.
+- `Z` / `X` — rewind / advance 10 seconds.
+- `M` / `J` — set a marker / jump back to it.
+- `V` — show or hide the Picture-in-Picture controls.

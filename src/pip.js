@@ -27,6 +27,25 @@ var PIP_HEARTBEAT_MS = 500;
 var PIP_ASPECT_SLACK = 0.03;
 var PIP_CANVAS_LONG_SIDE = 1280;
 var PIP_MAX_TILES = 4;
+// Same limits and default steps as Video Speed Controller. Relative changes
+// snap to 1x when they cross it, so 1.1x slower lands on 1x rather than 0.9x.
+var PIP_SPEED_MIN = 0.07;
+var PIP_SPEED_MAX = 16;
+var PIP_SPEED_STEP = 0.1;
+var PIP_SPEED_RESET = 1;
+var PIP_SPEED_FAST = 1.8;
+var PIP_SEEK_STEP = 10;
+var PIP_SPEED_KEYS = {
+  KeyS: 'slower',
+  KeyD: 'faster',
+  KeyR: 'reset',
+  KeyZ: 'rewind',
+  KeyX: 'advance',
+  KeyG: 'fast',
+  KeyV: 'display',
+  KeyM: 'mark',
+  KeyJ: 'jump'
+};
 var PIP_ICON_ON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a3.5 3.5 0 0 0-2-3.16v6.32A3.5 3.5 0 0 0 15.5 12z"/></svg>';
 var PIP_ICON_OFF = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4zm12.2.8 4 4-1.4 1.4-4-4 1.4-1.4zm-2.8 2.8 1.4 1.4-4 4-1.4-1.4 4-4z"/></svg>';
 var PIP_ICON_PLAY = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18"><path fill="currentColor" d="M8 5v14l11-7z"/></svg>';
@@ -65,6 +84,20 @@ function pipState() {
     parkedVideo: null,
     volume: null,
     muted: false,
+    volumePinned: false,
+    volumeDefendTimers: null,
+    volumeDefendFor: null,
+    speed: null,
+    speedBeforeReset: null,
+    applyingSpeed: false,
+    speedDefendTimers: null,
+    speedDefendFor: null,
+    speedSource: null,
+    onRateChange: null,
+    speedLabel: null,
+    controlsForce: null,
+    pointerInside: false,
+    controlsFlash: 0,
     lastAudible: 1,
     applyingVolume: false,
     volumeSource: null,
@@ -298,18 +331,313 @@ function readVolume(source) {
   paintVolumeControls();
 }
 
+// True when the media element already has the level chosen in the PiP controls.
+// A muted session keeps the previous audible level so unmute can restore it,
+// unless the slider itself was dragged to zero.
+function volumeMatches(source, state) {
+  if (!source || state.volume == null) return false;
+  if (state.muted) {
+    if (!source.muted) return false;
+    if (!(state.volume > 0) && source.volume > 0.001) return false;
+    return true;
+  }
+  var want = state.volume > 0 ? state.volume : (state.lastAudible || 1);
+  return !source.muted && Math.abs(source.volume - want) < 0.02;
+}
+
+function assignVolume(source) {
+  var state = pipState();
+  if (!source || state.volume == null) return;
+  state.applyingVolume = true;
+  try {
+    source.muted = !!state.muted;
+    if (state.muted) {
+      if (!(state.volume > 0)) source.volume = 0;
+    } else {
+      source.volume = state.volume > 0 ? state.volume : (state.lastAudible || 1);
+    }
+  } catch (e) {}
+  state.applyingVolume = false;
+}
+
+function clearVolumeDefend() {
+  var state = pipState();
+  var timers = state.volumeDefendTimers;
+  if (timers) {
+    for (var i = 0; i < timers.length; i++) clearTimeout(timers[i]);
+  }
+  state.volumeDefendTimers = null;
+}
+
+// Players often apply their own volume when the next video starts, after PiP
+// has already muted the element. Re-apply the pinned level for a short window
+// so that reset does not stick. A burst already in flight for this element is
+// left alone; volumechange still corrects the element immediately.
+function defendPinnedVolume(source) {
+  var state = pipState();
+  if (!state.volumePinned || !source) return;
+  if (state.volumeDefendFor === source && state.volumeDefendTimers) return;
+  clearVolumeDefend();
+  state.volumeDefendFor = source;
+  var delays = [0, 120, 360, 900, 1800];
+  var timers = [];
+  state.volumeDefendTimers = timers;
+  delays.forEach(function (delay, index) {
+    timers.push(setTimeout(function () {
+      var session = pipState();
+      if (session.volumeDefendTimers !== timers) return;
+      if (session.volumePinned && session.documentPipSource === source && !volumeMatches(source, session)) {
+        assignVolume(source);
+        paintVolumeControls();
+      }
+      if (index === delays.length - 1 && session.volumeDefendTimers === timers) {
+        session.volumeDefendTimers = null;
+      }
+    }, delay));
+  });
+}
+
 function writeVolume(source) {
   var state = pipState();
   if (!source) return;
   if (state.volume == null) {
-    readVolume(source);
+    if (!state.volumePinned) {
+      readVolume(source);
+      return;
+    }
+    state.volume = state.muted ? 0 : (state.lastAudible || 1);
+  }
+  assignVolume(source);
+  paintVolumeControls();
+  if (state.volumePinned) defendPinnedVolume(source);
+}
+
+function clampSpeed(speed) {
+  var next = Math.min(PIP_SPEED_MAX, Math.max(PIP_SPEED_MIN, speed));
+  return Number(next.toFixed(2));
+}
+
+function shownRate(video) {
+  var state = pipState();
+  var rate = state.speed != null ? state.speed : (video && video.playbackRate) || 1;
+  if (!isFinite(rate) || rate < 0) rate = 1;
+  return Number(rate.toFixed(2));
+}
+
+function paintSpeed() {
+  var state = pipState();
+  if (!state.speedLabel) return;
+  state.speedLabel.textContent = shownRate(state.documentPipSource || state.speedSource).toFixed(2) + '\u00d7';
+}
+
+function assignSpeed(source) {
+  var state = pipState();
+  if (!source || state.speed == null) return;
+  state.applyingSpeed = true;
+  try { source.playbackRate = state.speed; } catch (e) {}
+  state.applyingSpeed = false;
+}
+
+function clearSpeedDefend() {
+  var state = pipState();
+  var timers = state.speedDefendTimers;
+  if (timers) {
+    for (var i = 0; i < timers.length; i++) clearTimeout(timers[i]);
+  }
+  state.speedDefendTimers = null;
+}
+
+// Players write 1x again when the next video starts. Re-apply the chosen
+// rate for a short window, and keep correcting later ratechange events.
+function defendPinnedSpeed(source) {
+  var state = pipState();
+  if (state.speed == null || !source) return;
+  if (state.speedDefendFor === source && state.speedDefendTimers) return;
+  clearSpeedDefend();
+  state.speedDefendFor = source;
+  var delays = [0, 120, 360, 900, 1800];
+  var timers = [];
+  state.speedDefendTimers = timers;
+  delays.forEach(function (delay, index) {
+    timers.push(setTimeout(function () {
+      var session = pipState();
+      if (session.speedDefendTimers !== timers) return;
+      if (session.speed != null && session.speedSource === source &&
+          Math.abs(source.playbackRate - session.speed) >= 0.001) {
+        assignSpeed(source);
+        paintSpeed();
+      }
+      if (index === delays.length - 1 && session.speedDefendTimers === timers) {
+        session.speedDefendTimers = null;
+      }
+    }, delay));
+  });
+}
+
+function unbindSpeed(state) {
+  if (!state.speedSource || !state.onRateChange) {
+    state.speedSource = null;
+    state.onRateChange = null;
     return;
   }
-  state.applyingVolume = true;
-  source.muted = !!state.muted;
-  if (!state.muted) source.volume = state.volume > 0 ? state.volume : (state.lastAudible || 1);
-  state.applyingVolume = false;
-  paintVolumeControls();
+  state.speedSource.removeEventListener('ratechange', state.onRateChange);
+  state.speedSource.removeEventListener('play', state.onRateChange);
+  state.speedSource.removeEventListener('playing', state.onRateChange);
+  state.speedSource.removeEventListener('loadeddata', state.onRateChange);
+  state.speedSource.removeEventListener('emptied', state.onRateChange);
+  state.speedSource = null;
+  state.onRateChange = null;
+}
+
+function bindSpeed(source) {
+  var state = pipState();
+  if (!source || state.speedSource === source) return;
+  unbindSpeed(state);
+  state.speedSource = source;
+  state.onRateChange = function () {
+    var session = pipState();
+    if (session.applyingSpeed) return;
+    if (session.speed == null || session.speedSource !== source) {
+      paintSpeed();
+      return;
+    }
+    if (Math.abs(source.playbackRate - session.speed) < 0.001) return;
+    assignSpeed(source);
+    paintSpeed();
+    defendPinnedSpeed(source);
+  };
+  source.addEventListener('ratechange', state.onRateChange);
+  source.addEventListener('play', state.onRateChange);
+  source.addEventListener('playing', state.onRateChange);
+  source.addEventListener('loadeddata', state.onRateChange);
+  source.addEventListener('emptied', state.onRateChange);
+}
+
+function holdSpeed(video) {
+  if (!video || isProxy(video)) return;
+  bindSpeed(video);
+  if (pipState().speed != null) assignSpeed(video);
+  paintSpeed();
+}
+
+function speedTarget() {
+  var state = pipState();
+  if (state.documentPipSource) return state.documentPipSource;
+  if (state.guestVideo) return state.guestVideo;
+  var displayed = document.pictureInPictureElement;
+  if (displayed && displayed !== state.proxyVideo) return displayed;
+  if (displayed === state.proxyVideo && state.letterboxSource) return state.letterboxSource;
+  return findLargestPlayingVideo();
+}
+
+function maintainSpeed() {
+  var state = pipState();
+  if (state.speed == null || state.applyingSpeed) return;
+  var video = speedTarget();
+  if (!video) return;
+  if (video === state.speedSource && Math.abs(video.playbackRate - state.speed) < 0.001) return;
+  holdSpeed(video);
+}
+
+function applySpeed(video, speed) {
+  if (!video) return;
+  var state = pipState();
+  state.speed = clampSpeed(speed);
+  bindSpeed(video);
+  assignSpeed(video);
+  paintSpeed();
+  defendPinnedSpeed(video);
+  flashPipControls();
+}
+
+function changeSpeed(delta) {
+  var video = speedTarget();
+  if (!video) return;
+  var current = shownRate(video);
+  if (current < 0.1) current = 0;
+  var target = current + delta;
+  if ((current > 1 && target < 1) || (current < 1 && target > 1)) target = 1;
+  applySpeed(video, target);
+}
+
+// R and G share one memory. Leaving the target remembers the old rate;
+// pressing the same key again restores it. At the target with nothing
+// remembered, the key jumps to the other target (1x <-> 1.8x).
+function toggleSpeed(video, target, cross) {
+  if (!video) return;
+  var state = pipState();
+  var current = shownRate(video);
+  var goal = Number(target.toFixed(2));
+  var other = cross == null ? null : Number(cross.toFixed(2));
+  if (current === goal) {
+    if (state.speedBeforeReset != null) {
+      var remembered = state.speedBeforeReset;
+      state.speedBeforeReset = null;
+      applySpeed(video, remembered);
+    } else if (other != null && other !== goal) {
+      state.speedBeforeReset = current;
+      applySpeed(video, other);
+    } else {
+      applySpeed(video, goal);
+    }
+    return;
+  }
+  state.speedBeforeReset = current;
+  applySpeed(video, goal);
+}
+
+function seekBy(video, seconds) {
+  if (!video) return;
+  var next = (video.currentTime || 0) + seconds;
+  if (next < 0) next = 0;
+  if (isFinite(video.duration) && next > video.duration) next = video.duration;
+  try { video.currentTime = next; } catch (e) {}
+  paintSeek();
+}
+
+function setPipMark(video) {
+  if (!video) return;
+  video.__pipMark = video.currentTime;
+  video.__pipMarkReturn = null;
+}
+
+function jumpPipMark(video) {
+  if (!video || typeof video.__pipMark !== 'number') return;
+  if (video.__pipMarkReturn != null && Math.abs(video.currentTime - video.__pipMark) < 0.05) {
+    video.currentTime = video.__pipMarkReturn;
+    video.__pipMarkReturn = null;
+    return;
+  }
+  video.__pipMarkReturn = video.currentTime;
+  video.currentTime = video.__pipMark;
+}
+
+function isTypingContext(target) {
+  if (!target || !target.nodeName) return false;
+  if (target.nodeName === 'TEXTAREA' || target.isContentEditable) return true;
+  if (target.nodeName !== 'INPUT') return false;
+  var type = (target.type || '').toLowerCase();
+  return type !== 'range' && type !== 'button' && type !== 'checkbox';
+}
+
+function onPipSpeedKey(event) {
+  if (!event || event.ctrlKey || event.altKey || event.metaKey) return;
+  if (event.isComposing || event.key === 'Process' || event.key === 'Dead' || event.keyCode === 229) return;
+  var action = PIP_SPEED_KEYS[event.code];
+  if (!action) return;
+  if (event.repeat && action !== 'slower' && action !== 'faster' && action !== 'rewind' && action !== 'advance') return;
+  if (isTypingContext(event.target)) return;
+  var video = speedTarget();
+  if (!video && action !== 'display') return;
+  if (action === 'slower') changeSpeed(-PIP_SPEED_STEP);
+  else if (action === 'faster') changeSpeed(PIP_SPEED_STEP);
+  else if (action === 'reset') toggleSpeed(video, PIP_SPEED_RESET, PIP_SPEED_FAST);
+  else if (action === 'fast') toggleSpeed(video, PIP_SPEED_FAST, PIP_SPEED_RESET);
+  else if (action === 'rewind') seekBy(video, -PIP_SEEK_STEP);
+  else if (action === 'advance') seekBy(video, PIP_SEEK_STEP);
+  else if (action === 'mark') setPipMark(video);
+  else if (action === 'jump') jumpPipMark(video);
+  else if (action === 'display') togglePipControls();
 }
 
 function formatPipTime(seconds) {
@@ -389,17 +717,52 @@ function bindDocumentPlayback(source) {
   paintPlayButton();
 }
 
-function bindDocumentVolume(source) {
-  var state = pipState();
-  if (state.volumeSource && state.onVolumeChange) {
+function unbindVolume(state) {
+  if (!state.volumeSource) return;
+  if (state.onVolumeChange) {
     state.volumeSource.removeEventListener('volumechange', state.onVolumeChange);
   }
+  if (state.onPinnedVolume) {
+    state.volumeSource.removeEventListener('play', state.onPinnedVolume);
+    state.volumeSource.removeEventListener('playing', state.onPinnedVolume);
+    state.volumeSource.removeEventListener('loadeddata', state.onPinnedVolume);
+    state.volumeSource.removeEventListener('emptied', state.onPinnedVolume);
+  }
+  state.volumeSource = null;
+  state.onVolumeChange = null;
+  state.onPinnedVolume = null;
+}
+
+function bindDocumentVolume(source) {
+  var state = pipState();
+  unbindVolume(state);
   state.volumeSource = source;
+  // Once the PiP controls have set a level, keep it. The next video's player
+  // would otherwise write its own volume back and the listener would adopt it.
+  function reapplyPinned() {
+    var session = pipState();
+    if (session.applyingVolume || !session.volumePinned) return;
+    if (session.documentPipSource !== source) return;
+    if (volumeMatches(source, session)) return;
+    assignVolume(source);
+    paintVolumeControls();
+    defendPinnedVolume(source);
+  }
+  state.onPinnedVolume = reapplyPinned;
   state.onVolumeChange = function () {
-    if (pipState().applyingVolume) return;
+    var session = pipState();
+    if (session.applyingVolume) return;
+    if (session.volumePinned) {
+      reapplyPinned();
+      return;
+    }
     readVolume(source);
   };
   source.addEventListener('volumechange', state.onVolumeChange);
+  source.addEventListener('play', state.onPinnedVolume);
+  source.addEventListener('playing', state.onPinnedVolume);
+  source.addEventListener('loadeddata', state.onPinnedVolume);
+  source.addEventListener('emptied', state.onPinnedVolume);
 }
 
 function stopDocumentPipFit() {
@@ -414,6 +777,10 @@ function stopDocumentPipFit() {
 // into the window and scale the frame inside it.
 function fitDocumentPipVideo(source) {
   if (!source || !source.style) return;
+  // These overrides are for the PiP document only. Applying them after the
+  // element has moved back shrinks it inside the page.
+  var pipWindow = documentPipWindow();
+  if (!pipWindow || source.ownerDocument !== pipWindow.document) return;
   var state = pipState();
   if (state.fitObserver) state.fitObserver.disconnect();
   if (source.removeAttribute) {
@@ -458,19 +825,146 @@ function watchDocumentPipFit(source) {
   fitDocumentPipVideo(source);
 }
 
+var PIP_FIT_PROPS = [
+  'position', 'inset', 'left', 'top', 'right', 'bottom',
+  'width', 'height', 'max-width', 'max-height', 'min-width', 'min-height',
+  'margin', 'object-fit', 'object-position', 'aspect-ratio', 'transform'
+];
+
+function clearFitStyles(video) {
+  if (!video || !video.style || !video.style.removeProperty) return;
+  for (var i = 0; i < PIP_FIT_PROPS.length; i++) {
+    video.style.removeProperty(PIP_FIT_PROPS[i]);
+  }
+}
+
+function applyParkedPresentation(video, parked) {
+  if (!video) return;
+  clearFitStyles(video);
+  if (video.style) video.style.cssText = parked.cssText || '';
+  if (!video.setAttribute) return;
+  if (parked.widthAttr == null) video.removeAttribute('width');
+  else video.setAttribute('width', parked.widthAttr);
+  if (parked.heightAttr == null) video.removeAttribute('height');
+  else video.setAttribute('height', parked.heightAttr);
+}
+
+// Keep the player from adopting the PiP window's box. Players measure the
+// video after it leaves and write that smaller size onto the surrounding nodes.
+function holdAncestorBoxes(video) {
+  var holds = [];
+  var box = video.getBoundingClientRect();
+  if (box.width < 160 || box.height < 90) return holds;
+  var node = video.parentElement;
+  var depth = 0;
+  while (node && depth < 3 && node !== document.body && node !== document.documentElement) {
+    var width = node.clientWidth;
+    var height = node.clientHeight;
+    // Skip ancestors much larger than the player, such as the page column.
+    if (node.style &&
+        width >= box.width * 0.8 && width <= box.width * 1.5 &&
+        height >= box.height * 0.8 && height <= box.height * 1.5) {
+      holds.push({
+        node: node,
+        width: width,
+        height: height,
+        cssText: node.style.cssText
+      });
+      node.style.setProperty('min-width', Math.round(width) + 'px', 'important');
+      node.style.setProperty('min-height', Math.round(height) + 'px', 'important');
+    }
+    node = node.parentElement;
+    depth++;
+  }
+  return holds;
+}
+
+function releaseLayoutHolds(parked) {
+  var holds = parked.holds || [];
+  for (var i = 0; i < holds.length; i++) {
+    var hold = holds[i];
+    if (!hold.node || !hold.node.style) continue;
+    hold.node.style.cssText = hold.cssText || '';
+  }
+}
+
+function layoutShrunk(video, parked) {
+  if (!video || !video.isConnected || video.ownerDocument !== document) return false;
+  if (!(parked.boxWidth >= 160) || !(parked.boxHeight >= 90)) return false;
+  var rect = video.getBoundingClientRect();
+  var parent = video.parentElement;
+  var parentW = parent ? parent.clientWidth : 0;
+  var parentH = parent ? parent.clientHeight : 0;
+  var widthShort = rect.width < parked.boxWidth * 0.85 &&
+    !(parentW >= 160 && rect.width >= parentW * 0.85);
+  var heightShort = rect.height < parked.boxHeight * 0.85 &&
+    !(parentH >= 90 && rect.height >= parentH * 0.85);
+  if (widthShort || heightShort) return true;
+  var holds = parked.holds || [];
+  for (var i = 0; i < holds.length; i++) {
+    var hold = holds[i];
+    if (!hold.node || !hold.node.isConnected) continue;
+    if (window.innerWidth < hold.width * 0.85) continue;
+    if (hold.node.clientWidth < hold.width * 0.85) return true;
+    if (hold.node.clientHeight < hold.height * 0.85) return true;
+  }
+  return false;
+}
+
+function fillVideoToParent(video) {
+  var parent = video.parentElement;
+  if (!parent || !video.style) return;
+  var width = parent.clientWidth;
+  var height = parent.clientHeight;
+  if (width < 160 || height < 90) return;
+  video.style.setProperty('width', Math.round(width) + 'px');
+  video.style.setProperty('height', Math.round(height) + 'px');
+  video.style.removeProperty('max-width');
+  video.style.removeProperty('max-height');
+}
+
+function nudgePlayerLayout() {
+  try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+}
+
+function reapplyParkedLayout(parked) {
+  var video = parked.video;
+  if (!video || video.ownerDocument !== document) return;
+  applyParkedPresentation(video, parked);
+  var holds = parked.holds || [];
+  for (var i = 0; i < holds.length; i++) {
+    var hold = holds[i];
+    if (!hold.node || !hold.node.style || !hold.node.isConnected) continue;
+    if (window.innerWidth < hold.width * 0.85) continue;
+    if (hold.node.clientWidth < hold.width * 0.85 || hold.node.clientHeight < hold.height * 0.85) {
+      hold.node.style.cssText = hold.cssText || '';
+    }
+  }
+  nudgePlayerLayout();
+  if (layoutShrunk(video, parked)) fillVideoToParent(video);
+}
+
+function scheduleLayoutRestore(parked) {
+  if (parked.timers) {
+    for (var i = 0; i < parked.timers.length; i++) clearTimeout(parked.timers[i]);
+  }
+  var delays = [0, 50, 150, 400, 900, 1600];
+  parked.timers = [];
+  delays.forEach(function (delay) {
+    parked.timers.push(setTimeout(function () {
+      if (!layoutShrunk(parked.video, parked)) return;
+      reapplyParkedLayout(parked);
+    }, delay));
+  });
+}
+
 function restoreParkedVideo(pause) {
   var state = pipState();
   var parked = state.parkedVideo;
   if (!parked || !parked.video) return;
   stopDocumentPipFit();
   var video = parked.video;
-  video.style.cssText = parked.cssText || '';
-  if (video.setAttribute) {
-    if (parked.widthAttr == null) video.removeAttribute('width');
-    else video.setAttribute('width', parked.widthAttr);
-    if (parked.heightAttr == null) video.removeAttribute('height');
-    else video.setAttribute('height', parked.heightAttr);
-  }
+  applyParkedPresentation(video, parked);
   var parent = parked.parent;
   if (parent && parent.isConnected) {
     if (parked.next && parked.next.parentNode === parent) parent.insertBefore(video, parked.next);
@@ -478,17 +972,18 @@ function restoreParkedVideo(pause) {
   } else if (document.body) {
     document.body.appendChild(video);
   }
+  // Drop the size lock only after the video is back, so the player cannot
+  // collapse around the empty slot and keep that smaller box.
+  releaseLayoutHolds(parked);
   state.parkedVideo = null;
+  reapplyParkedLayout(parked);
+  scheduleLayoutRestore(parked);
   if (pause) video.pause();
 }
 
 function cleanupDocumentPip() {
   var state = pipState();
-  if (state.volumeSource && state.onVolumeChange) {
-    state.volumeSource.removeEventListener('volumechange', state.onVolumeChange);
-  }
-  state.volumeSource = null;
-  state.onVolumeChange = null;
+  unbindVolume(state);
   if (state.playbackSource && state.onPlay) {
     state.playbackSource.removeEventListener('play', state.onPlay);
     state.playbackSource.removeEventListener('pause', state.onPause);
@@ -528,6 +1023,9 @@ function exitExtensionPip() {
 function onDocumentPipHide() {
   var state = pipState();
   if (state.closingDocumentPip) return;
+  // Ignore the watcher while the element moves back, or it fits the page video
+  // to the PiP box and then closes before that style can be restored.
+  state.suppressUntil = performance.now() + 1000;
   cleanupDocumentPip();
   endPipSession();
 }
@@ -541,13 +1039,17 @@ function attachSourceToDocumentPip(source) {
   var wasPlaying = !source.paused && !source.ended;
   if (source.ownerDocument === document) notePipSize(source);
   restoreParkedVideo(true);
+  var box = source.getBoundingClientRect();
   state.parkedVideo = {
     video: source,
     parent: source.parentNode,
     next: source.nextSibling,
     cssText: source.style ? source.style.cssText : '',
     widthAttr: source.getAttribute ? source.getAttribute('width') : null,
-    heightAttr: source.getAttribute ? source.getAttribute('height') : null
+    heightAttr: source.getAttribute ? source.getAttribute('height') : null,
+    boxWidth: box.width,
+    boxHeight: box.height,
+    holds: holdAncestorBoxes(source)
   };
   tile.appendChild(source);
   watchDocumentPipFit(source);
@@ -560,6 +1062,7 @@ function attachSourceToDocumentPip(source) {
   bindDocumentPlayback(source);
   bindDocumentSeek(source);
   writeVolume(source);
+  holdSpeed(source);
   markPipVideo(source);
   rememberHostTile();
   return true;
@@ -589,6 +1092,14 @@ function buildDocumentPip(pipWindow) {
     '.pip-seekbar[hidden]{display:none}',
     '.pip-seek{flex:1;min-width:0;accent-color:#fff}',
     '.pip-time{color:#fff;font:11px/1 system-ui,sans-serif;white-space:nowrap}',
+    '.pip-speed-label{min-width:3.4em;border:0;padding:0 2px;background:transparent;color:#fff;',
+    'font:12px/1 system-ui,sans-serif;cursor:pointer}',
+    '.pip-volume,.pip-seekbar,.pip-tile-close{opacity:1;transition:opacity .15s ease}',
+    '.pip-stage.pip-controls-hidden .pip-volume,.pip-stage.pip-controls-hidden .pip-volume *,',
+    '.pip-stage.pip-controls-hidden .pip-seekbar,.pip-stage.pip-controls-hidden .pip-seekbar *,',
+    '.pip-stage.pip-controls-hidden .pip-tile-close{opacity:0;pointer-events:none}',
+    '.pip-stage.pip-controls-flash .pip-volume,.pip-stage.pip-controls-flash .pip-seekbar,',
+    '.pip-stage.pip-controls-flash .pip-tile-close{opacity:1;pointer-events:auto}',
     '.pip-volume,.pip-volume *,.pip-seekbar,.pip-seekbar *,.pip-tile-close{cursor:pointer}',
     '.pip-mute{width:28px;height:28px;flex:none;border:0;padding:0;background:transparent;color:#fff;cursor:pointer}'
   ].join('');
@@ -599,7 +1110,7 @@ function buildDocumentPip(pipWindow) {
   doc.body.style.background = '#000';
 
   var stage = doc.createElement('div');
-  stage.className = 'pip-stage';
+  stage.className = 'pip-stage pip-controls-hidden';
   var grid = doc.createElement('div');
   grid.className = 'pip-grid';
   var hostTile = doc.createElement('div');
@@ -637,7 +1148,27 @@ function buildDocumentPip(pipWindow) {
   seek.setAttribute('aria-label', 'Seek');
   var seekTime = doc.createElement('span');
   seekTime.className = 'pip-time';
+  var slower = doc.createElement('button');
+  slower.type = 'button';
+  slower.className = 'pip-mute';
+  slower.textContent = '\u2212';
+  slower.setAttribute('aria-label', 'Slower');
+  slower.title = 'Slower (S)';
+  var speedLabel = doc.createElement('button');
+  speedLabel.type = 'button';
+  speedLabel.className = 'pip-speed-label';
+  speedLabel.setAttribute('aria-label', 'Reset speed');
+  speedLabel.title = 'Reset speed (R)';
+  var faster = doc.createElement('button');
+  faster.type = 'button';
+  faster.className = 'pip-mute';
+  faster.textContent = '+';
+  faster.setAttribute('aria-label', 'Faster');
+  faster.title = 'Faster (D)';
   seekBar.appendChild(play);
+  seekBar.appendChild(slower);
+  seekBar.appendChild(speedLabel);
+  seekBar.appendChild(faster);
   seekBar.appendChild(seek);
   seekBar.appendChild(seekTime);
   stage.appendChild(bar);
@@ -655,9 +1186,17 @@ function buildDocumentPip(pipWindow) {
   state.seekSlider = seek;
   state.seekTime = seekTime;
   state.seekBar = seekBar;
+  state.speedLabel = speedLabel;
   paintVolumeControls();
   paintPlayButton();
   paintSeek();
+  paintSpeed();
+  slower.addEventListener('click', function () { changeSpeed(-PIP_SPEED_STEP); });
+  faster.addEventListener('click', function () { changeSpeed(PIP_SPEED_STEP); });
+  speedLabel.addEventListener('click', function () {
+    toggleSpeed(pipState().documentPipSource, PIP_SPEED_RESET, PIP_SPEED_FAST);
+  });
+  pipWindow.document.addEventListener('keydown', onPipSpeedKey, true);
   seek.addEventListener('input', function () {
     var session = pipState();
     session.seeking = true;
@@ -686,25 +1225,79 @@ function buildDocumentPip(pipWindow) {
     var value = Number(slider.value);
     session.volume = value;
     session.muted = value === 0;
+    session.volumePinned = true;
     if (value > 0) session.lastAudible = value;
     var current = session.documentPipSource;
     if (!current) {
       paintVolumeControls();
       return;
     }
-    session.applyingVolume = true;
-    current.muted = value === 0;
-    current.volume = value;
-    session.applyingVolume = false;
-    paintVolumeControls();
+    writeVolume(current);
   });
   mute.addEventListener('click', function () {
     var session = pipState();
     session.muted = !session.muted;
+    session.volumePinned = true;
     if (!session.muted && !(session.volume > 0)) session.volume = session.lastAudible || 1;
     writeVolume(session.documentPipSource);
   });
+  bindPipControlsHover(pipWindow);
   installPipDrag(stage);
+}
+
+function togglePipControls() {
+  var state = pipState();
+  var stage = state.pipStage;
+  if (!stage || !stage.classList) return;
+  var hidden = stage.classList.contains('pip-controls-hidden');
+  state.controlsForce = hidden ? 'show' : 'hide';
+  if (hidden) stage.classList.remove('pip-controls-hidden');
+  else stage.classList.add('pip-controls-hidden');
+}
+
+function flashPipControls() {
+  var state = pipState();
+  var stage = state.pipStage;
+  if (!stage || !stage.classList || state.controlsForce === 'hide') return;
+  stage.classList.add('pip-controls-flash');
+  clearTimeout(state.controlsFlash);
+  state.controlsFlash = setTimeout(function () {
+    var current = pipState().pipStage;
+    if (current && current.classList) current.classList.remove('pip-controls-flash');
+  }, 1200);
+}
+
+// Controls stay hidden until the pointer is over the PiP window, then hide
+// again as soon as it leaves. pointermove covers a window that opens under
+// the cursor, which does not fire a fresh enter event.
+function bindPipControlsHover(pipWindow) {
+  var root = pipWindow.document.documentElement;
+  function show() {
+    var session = pipState();
+    session.pointerInside = true;
+    if (session.controlsForce === 'hide') return;
+    var stage = session.pipStage;
+    if (stage && stage.classList) stage.classList.remove('pip-controls-hidden');
+  }
+  function hide(event) {
+    if (event && event.relatedTarget && root.contains(event.relatedTarget)) return;
+    var session = pipState();
+    session.pointerInside = false;
+    if (session.controlsForce === 'show') return;
+    var stage = session.pipStage;
+    if (stage && stage.classList) stage.classList.add('pip-controls-hidden');
+  }
+  root.addEventListener('pointerenter', show);
+  root.addEventListener('pointerleave', hide);
+  root.addEventListener('mouseenter', show);
+  root.addEventListener('mouseleave', hide);
+  // Leaving the PiP window sets relatedTarget to null. Moving between controls
+  // inside the window keeps a target that is still in this document.
+  pipWindow.document.addEventListener('mouseout', function (event) {
+    if (event.relatedTarget && root.contains(event.relatedTarget)) return;
+    hide(event);
+  });
+  pipWindow.addEventListener('pointermove', show);
 }
 
 function openDocumentPip(video) {
@@ -904,6 +1497,9 @@ function endPipSession() {
   state.nativeOnly = false;
   state.lockedAspect = 0;
   state.letterboxBlocked = false;
+  clearVolumeDefend();
+  state.volumeDefendFor = null;
+  state.volumePinned = false;
   state.volume = null;
   state.muted = false;
   cleanupDocumentPip();
@@ -963,6 +1559,7 @@ function showLetterboxed(source) {
   }
   pushLetterboxFrame();
   startLetterboxLoop();
+  holdSpeed(source);
   if (document.pictureInPictureElement === state.proxyVideo) return;
   if (state.requesting) return;
   state.requesting = source;
@@ -986,6 +1583,7 @@ function showLetterboxed(source) {
     return state.proxyVideo.requestPictureInPicture();
   }).then(function () {
     markPipVideo(source);
+    holdSpeed(source);
   }).catch(function () {
     fellBack = true;
     state.requesting = null;
@@ -1013,6 +1611,7 @@ function presentNativePip(video) {
   }).then(function () {
     state.openingNative = false;
     markPipVideo(video);
+    holdSpeed(video);
     watchPipSession();
   }).catch(function () {
     state.openingNative = false;
@@ -1072,6 +1671,7 @@ function switchPipVideo(video) {
   }
   Promise.resolve(pending).then(function () {
     markPipVideo(video);
+    holdSpeed(video);
   }).catch(function () {
     state.failedVideo = video;
     state.failedUntil = performance.now() + PIP_STUCK_MS;
@@ -1082,6 +1682,7 @@ function switchPipVideo(video) {
 }
 
 function updatePipVideo() {
+  maintainSpeed();
   var state = pipState();
   if (state.guestActive) {
     updateGuestTile();
@@ -1185,6 +1786,7 @@ function installPipWatcher() {
   var state = pipState();
   if (state.installed) return;
   state.installed = true;
+  document.addEventListener('keydown', onPipSpeedKey, true);
 
   state.resizeObserver = new ResizeObserver(function () {
     schedulePipUpdate();
@@ -1800,6 +2402,7 @@ function retargetGuest(video) {
   hideGuestVideo(video);
   state.guestStream = stream;
   state.guestVideo = video;
+  holdSpeed(video);
   var pc = state.guestPc;
   var sender = pc && pc.getSenders && pc.getSenders().filter(function (item) {
     return item.track && item.track.kind === 'video';
