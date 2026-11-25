@@ -121,6 +121,9 @@ function pipState() {
     seekTime: null,
     seekBar: null,
     seeking: false,
+    seekApplyTimer: 0,
+    seekVideo: null,
+    seekTarget: null,
     seekSource: null,
     onTimeUpdate: null,
     closingDocumentPip: false,
@@ -685,13 +688,41 @@ function toggleSpeed(video, target, cross) {
   applySpeed(video, goal);
 }
 
-function seekBy(video, seconds) {
+function intendedTime(video) {
+  var state = pipState();
+  if (state.seekApplyTimer && state.seekVideo === video && state.seekTarget != null) return state.seekTarget;
+  return video.currentTime || 0;
+}
+
+function scheduleSeek(video, time) {
   if (!video) return;
-  var next = (video.currentTime || 0) + seconds;
+  var state = pipState();
+  var next = time;
   if (next < 0) next = 0;
   if (isFinite(video.duration) && next > video.duration) next = video.duration;
-  try { video.currentTime = next; } catch (e) {}
+  state.seekVideo = video;
+  state.seekTarget = next;
+  // Each currentTime write flushes the decoder. A wheel notch or a drag
+  // step would otherwise restart that work dozens of times and the picture
+  // judders. Keep the latest target and write it once the gesture settles.
+  clearTimeout(state.seekApplyTimer);
+  state.seekApplyTimer = setTimeout(function () {
+    var session = pipState();
+    var target = session.seekVideo;
+    var at = session.seekTarget;
+    session.seekApplyTimer = 0;
+    session.seekVideo = null;
+    session.seekTarget = null;
+    if (!target || at == null) return;
+    try { target.currentTime = at; } catch (e) {}
+    paintSeek();
+  }, 120);
   paintSeek();
+}
+
+function seekBy(video, seconds) {
+  if (!video) return;
+  scheduleSeek(video, intendedTime(video) + seconds);
 }
 
 // Vertical wheel up, or a horizontal wheel to the right, moves later in the video.
@@ -997,7 +1028,8 @@ function paintSeek() {
   if (state.seekBar) state.seekBar.hidden = !seekable;
   if (!seekable) return;
   bar.max = String(source.duration);
-  var shown = state.seeking ? Number(bar.value) : (source.currentTime || 0);
+  var pending = state.seekApplyTimer && state.seekVideo === source && state.seekTarget != null;
+  var shown = state.seeking ? Number(bar.value) : (pending ? state.seekTarget : (source.currentTime || 0));
   if (!state.seeking) bar.value = String(shown);
   if (state.seekTime) {
     state.seekTime.textContent = formatPipTime(shown) + ' / ' + formatPipTime(source.duration);
@@ -1535,15 +1567,15 @@ function buildDocumentPip(pipWindow) {
   });
   pipWindow.document.addEventListener('keydown', onPipSpeedKey, true);
   seek.addEventListener('input', function () {
-    var session = pipState();
-    session.seeking = true;
-    var current = session.documentPipSource;
-    if (canSeek(current)) current.currentTime = Number(seek.value);
+    pipState().seeking = true;
     paintSeek();
   });
   seek.addEventListener('change', function () {
-    pipState().seeking = false;
-    paintSeek();
+    var session = pipState();
+    var current = session.documentPipSource;
+    session.seeking = false;
+    if (canSeek(current)) scheduleSeek(current, Number(seek.value));
+    else paintSeek();
   });
   play.addEventListener('click', function () {
     var current = pipState().documentPipSource;
@@ -2043,6 +2075,9 @@ function updatePipVideo() {
     if (fallback) presentPip(fallback);
     return;
   }
+  // Seeking drops readyState and looks like a stall. Swapping or refitting
+  // the picture then restarts the seek and the frame stutters.
+  if (logical.seeking || (state.seekApplyTimer && state.seekVideo === logical)) return;
   if (docPip) fitDocumentPipVideo(logical);
   notePipSize(logical);
   if (!state.lockedAspect) {
