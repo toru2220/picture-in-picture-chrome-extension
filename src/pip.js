@@ -1092,8 +1092,10 @@ function buildDocumentPip(pipWindow) {
     '.pip-seekbar[hidden]{display:none}',
     '.pip-seek{flex:1;min-width:0;accent-color:#fff}',
     '.pip-time{color:#fff;font:11px/1 system-ui,sans-serif;white-space:nowrap}',
-    '.pip-speed-label{min-width:3.4em;border:0;padding:0 2px;background:transparent;color:#fff;',
-    'font:12px/1 system-ui,sans-serif;cursor:pointer}',
+    '.pip-speed-label{position:absolute;z-index:4;top:10px;left:10px;min-width:3.2em;border:0;',
+    'border-radius:8px;padding:6px 10px;background:#ffe14a;color:#1a1a1a;',
+    '-webkit-appearance:none;appearance:none;',
+    'font:700 22px/1 system-ui,sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.45)}',
     '.pip-volume,.pip-seekbar,.pip-tile-close{opacity:1;transition:opacity .15s ease}',
     '.pip-stage.pip-controls-hidden .pip-volume,.pip-stage.pip-controls-hidden .pip-volume *,',
     '.pip-stage.pip-controls-hidden .pip-seekbar,.pip-stage.pip-controls-hidden .pip-seekbar *,',
@@ -1167,12 +1169,12 @@ function buildDocumentPip(pipWindow) {
   faster.title = 'Faster (D)';
   seekBar.appendChild(play);
   seekBar.appendChild(slower);
-  seekBar.appendChild(speedLabel);
   seekBar.appendChild(faster);
   seekBar.appendChild(seek);
   seekBar.appendChild(seekTime);
   stage.appendChild(bar);
   stage.appendChild(seekBar);
+  stage.appendChild(speedLabel);
   doc.body.appendChild(stage);
 
   var state = pipState();
