@@ -37,6 +37,8 @@ var PIP_SPEED_FAST = 1.8;
 // Same yellow as the solid badge, at half opacity so the picture shows through.
 var PIP_SPEED_BADGE_BG = 'rgba(255,225,74,.5)';
 var PIP_SEEK_STEP = 10;
+// One mouse-wheel notch is about 100 pixels. That jumps five seconds.
+var PIP_WHEEL_SEEK_STEP = 5;
 var PIP_SPEED_KEYS = {
   KeyS: 'slower',
   KeyD: 'faster',
@@ -673,6 +675,28 @@ function seekBy(video, seconds) {
   paintSeek();
 }
 
+// Vertical wheel up, or a horizontal wheel to the right, moves later in the video.
+function wheelSeekSeconds(event) {
+  if (!event) return 0;
+  var dx = event.deltaX || 0;
+  var dy = event.deltaY || 0;
+  var pixels = Math.abs(dx) > Math.abs(dy) ? dx : -dy;
+  if (event.deltaMode === 1) pixels *= 16;
+  else if (event.deltaMode === 2) pixels *= 800;
+  if (!pixels) return 0;
+  return pixels / 100 * PIP_WHEEL_SEEK_STEP;
+}
+
+function onSeekBarWheel(event) {
+  var source = pipState().documentPipSource;
+  if (!canSeek(source)) return;
+  var seconds = wheelSeekSeconds(event);
+  if (!seconds) return;
+  event.preventDefault();
+  event.stopPropagation();
+  seekBy(source, seconds);
+}
+
 function setPipMark(video) {
   if (!video) return;
   video.__pipMark = video.currentTime;
@@ -1256,6 +1280,7 @@ function buildDocumentPip(pipWindow) {
   seekBar.appendChild(faster);
   seekBar.appendChild(seek);
   seekBar.appendChild(seekTime);
+  seekBar.addEventListener('wheel', onSeekBarWheel, { capture: true, passive: false });
   stage.appendChild(bar);
   stage.appendChild(seekBar);
   stage.appendChild(speedLabel);
