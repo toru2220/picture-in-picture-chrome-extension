@@ -34,6 +34,8 @@ var PIP_SPEED_MAX = 16;
 var PIP_SPEED_STEP = 0.1;
 var PIP_SPEED_RESET = 1;
 var PIP_SPEED_FAST = 1.8;
+// Same yellow as the solid badge, at half opacity so the picture shows through.
+var PIP_SPEED_BADGE_BG = 'rgba(255,225,74,.5)';
 var PIP_SEEK_STEP = 10;
 var PIP_SPEED_KEYS = {
   KeyS: 'slower',
@@ -95,6 +97,9 @@ function pipState() {
     speedSource: null,
     onRateChange: null,
     speedLabel: null,
+    pageSpeedBadge: null,
+    pageSpeedHidden: false,
+    pageSpeedTimer: 0,
     controlsForce: null,
     pointerInside: false,
     controlsFlash: 0,
@@ -424,10 +429,83 @@ function shownRate(video) {
   return Number(rate.toFixed(2));
 }
 
+function speedText(video) {
+  return shownRate(video).toFixed(2) + '\u00d7';
+}
+
 function paintSpeed() {
   var state = pipState();
-  if (!state.speedLabel) return;
-  state.speedLabel.textContent = shownRate(state.documentPipSource || state.speedSource).toFixed(2) + '\u00d7';
+  if (state.speedLabel) {
+    state.speedLabel.textContent = speedText(state.documentPipSource || state.speedSource);
+  }
+  placePageSpeedBadge();
+}
+
+// The page video keeps its own badge. Document PiP moves that element into
+// another window, which already has the same badge, so the page one hides.
+function pageSpeedVideo() {
+  var state = pipState();
+  if (state.pageSpeedHidden || state.guestActive || documentPipWindow()) return null;
+  var video = speedTarget();
+  if (!video || isProxy(video) || !video.isConnected || video.ownerDocument !== document) return null;
+  return video;
+}
+
+function ensurePageSpeedBadge() {
+  var state = pipState();
+  if (state.pageSpeedBadge) return state.pageSpeedBadge;
+  var parent = document.documentElement || document.body;
+  if (!parent) return null;
+  var badge = document.createElement('button');
+  badge.type = 'button';
+  badge.className = 'pip-page-speed';
+  badge.setAttribute('aria-label', 'Reset speed');
+  badge.title = 'Reset speed (R)';
+  badge.style.cssText = [
+    'position:fixed',
+    'z-index:2147483646',
+    'margin:0',
+    'min-width:3.2em',
+    'border:0',
+    'border-radius:8px',
+    'padding:6px 10px',
+    'background:' + PIP_SPEED_BADGE_BG,
+    'color:#1a1a1a',
+    '-webkit-appearance:none',
+    'appearance:none',
+    'font:700 22px/1 system-ui,sans-serif',
+    'cursor:pointer',
+    'box-shadow:0 1px 4px rgba(0,0,0,.35)',
+    'display:none'
+  ].join(';');
+  badge.addEventListener('pointerdown', function (event) { event.stopPropagation(); });
+  badge.addEventListener('click', function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleSpeed(speedTarget(), PIP_SPEED_RESET, PIP_SPEED_FAST);
+  });
+  parent.appendChild(badge);
+  state.pageSpeedBadge = badge;
+  return badge;
+}
+
+function placePageSpeedBadge() {
+  var badge = ensurePageSpeedBadge();
+  if (!badge) return;
+  var video = pageSpeedVideo();
+  if (!video) {
+    badge.style.display = 'none';
+    return;
+  }
+  var rect = video.getBoundingClientRect();
+  if (rect.width < 120 || rect.height < 68) {
+    badge.style.display = 'none';
+    return;
+  }
+  badge.style.display = 'inline-block';
+  badge.style.top = Math.round(rect.top + 10) + 'px';
+  badge.style.left = Math.round(rect.left + 10) + 'px';
+  badge.textContent = speedText(video);
 }
 
 function assignSpeed(source) {
@@ -637,7 +715,13 @@ function onPipSpeedKey(event) {
   else if (action === 'advance') seekBy(video, PIP_SEEK_STEP);
   else if (action === 'mark') setPipMark(video);
   else if (action === 'jump') jumpPipMark(video);
-  else if (action === 'display') togglePipControls();
+  else if (action === 'display') {
+    if (pipState().pipStage) togglePipControls();
+    else {
+      pipState().pageSpeedHidden = !pipState().pageSpeedHidden;
+      placePageSpeedBadge();
+    }
+  }
 }
 
 function formatPipTime(seconds) {
@@ -1093,7 +1177,7 @@ function buildDocumentPip(pipWindow) {
     '.pip-seek{flex:1;min-width:0;accent-color:#fff}',
     '.pip-time{color:#fff;font:11px/1 system-ui,sans-serif;white-space:nowrap}',
     '.pip-speed-label{position:absolute;z-index:4;top:10px;left:10px;min-width:3.2em;border:0;',
-    'border-radius:8px;padding:6px 10px;background:#ffe14a;color:#1a1a1a;',
+    'border-radius:8px;padding:6px 10px;background:' + PIP_SPEED_BADGE_BG + ';color:#1a1a1a;',
     '-webkit-appearance:none;appearance:none;',
     'font:700 22px/1 system-ui,sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.45)}',
     '.pip-volume,.pip-seekbar,.pip-tile-close{opacity:1;transition:opacity .15s ease}',
@@ -1685,6 +1769,7 @@ function switchPipVideo(video) {
 
 function updatePipVideo() {
   maintainSpeed();
+  placePageSpeedBadge();
   var state = pipState();
   if (state.guestActive) {
     updateGuestTile();
@@ -1789,6 +1874,10 @@ function installPipWatcher() {
   if (state.installed) return;
   state.installed = true;
   document.addEventListener('keydown', onPipSpeedKey, true);
+  window.addEventListener('scroll', placePageSpeedBadge, true);
+  window.addEventListener('resize', placePageSpeedBadge);
+  if (!state.pageSpeedTimer) state.pageSpeedTimer = setInterval(placePageSpeedBadge, 500);
+  placePageSpeedBadge();
 
   state.resizeObserver = new ResizeObserver(function () {
     schedulePipUpdate();

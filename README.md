@@ -16,7 +16,7 @@ chrome://extensions/shortcuts
 
 The shortcuts below match Video Speed Controller. They adjust the video on
 the page, and they keep working inside the Picture-in-Picture window. The
-window also has − / + buttons. The current speed sits at the top-left, in large dark type on a yellow badge. Click it to reset.
+window also has − / + buttons. The current speed sits at the top-left of the video, on the page and inside Picture-in-Picture, in large dark type on a translucent yellow badge. Click it to reset. Press `V` on the page to hide that badge.
 A speed you set is applied again when the player loads the next video.
 
 - `S` / `D` — slower / faster by 0.1×. Crossing 1× snaps to 1×.
