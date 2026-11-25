@@ -365,8 +365,25 @@ function assignVolume(source) {
     } else {
       source.volume = state.volume > 0 ? state.volume : (state.lastAudible || 1);
     }
+    applyPlayerVolume(source, state);
   } catch (e) {}
   state.applyingVolume = false;
+}
+
+// YouTube keeps its own level and will undo a change made only on the media
+// element. The player that still contains the video accepts the same level.
+function applyPlayerVolume(source, state) {
+  var node = source && source.parentElement;
+  var level = state.muted ? 0 : source.volume;
+  for (var i = 0; node && i < 8; i++) {
+    if (typeof node.setVolume === 'function') {
+      if (state.muted && typeof node.mute === 'function') node.mute();
+      else if (!state.muted && typeof node.unMute === 'function') node.unMute();
+      node.setVolume(Math.round((level || 0) * 100));
+      return;
+    }
+    node = node.parentElement;
+  }
 }
 
 function clearVolumeDefend() {
@@ -831,14 +848,67 @@ function adjustVolumeBy(video, delta) {
 
 function videoUnderPointer(event) {
   if (!event || event.clientX == null || event.clientY == null) return null;
-  var videos = pageVideos().filter(function (video) {
-    if (!video.isConnected || !video.getBoundingClientRect) return false;
-    var box = video.getBoundingClientRect();
-    if (box.width < 120 || box.height < 68) return false;
-    return event.clientX >= box.left && event.clientX <= box.right &&
-      event.clientY >= box.top && event.clientY <= box.bottom;
+  var x = event.clientX;
+  var y = event.clientY;
+  var videos = videosNearPoint(event).filter(function (video) {
+    if (!video.isConnected || isThumbnailContext(video)) return false;
+    var box = pictureBox(video);
+    if (box.width < 240 || box.height < 135) return false;
+    return x >= box.left && x <= box.right && y >= box.top && y <= box.bottom;
   }).sort(function (a, b) { return videoArea(b) - videoArea(a); });
   return videos[0] || null;
+}
+
+var PIP_THUMB_TAG = /^(YTD-THUMBNAIL|YTD-RICH-GRID-MEDIA|YTD-RICH-ITEM-RENDERER|YTD-COMPACT-VIDEO-RENDERER|YTD-VIDEO-PREVIEW|YTD-PLAYLIST-THUMBNAIL|YTD-GRID-VIDEO-RENDERER|YTD-REEL-ITEM-RENDERER|YTD-PLAYLIST-VIDEO-RENDERER|YTD-PLAYLIST-PANEL-VIDEO-RENDERER)$/;
+
+function isThumbnailContext(node) {
+  var current = node;
+  for (var i = 0; current && i < 12; i++) {
+    var tag = current.tagName || '';
+    if (PIP_THUMB_TAG.test(tag)) return true;
+    var cls = typeof current.className === 'string' ? current.className : '';
+    if (/\b(thumbnail|video-preview|storyboard|preview-video)\b/i.test(cls) &&
+        !/html5-video-player|html5-main-video/i.test(cls)) return true;
+    current = current.parentElement;
+  }
+  return false;
+}
+
+// The visible picture is often the player around the media element, including
+// its letterbox, while the seek bar stays a separate control.
+function pictureBox(video) {
+  var box = video.getBoundingClientRect();
+  var node = video.parentElement;
+  for (var i = 0; node && i < 6; i++) {
+    if (isThumbnailContext(node)) break;
+    var cls = typeof node.className === 'string' ? node.className : '';
+    if (/html5-video-player|html5-video-container|video-player|media-player|jwplayer|plyr|vjs-/i.test(cls) &&
+        node.getBoundingClientRect) {
+      var rect = node.getBoundingClientRect();
+      if (rect.width >= box.width && rect.height >= box.height &&
+          rect.width <= Math.max(box.width, 1) * 1.85 &&
+          rect.height <= Math.max(box.height, 1) * 1.85) {
+        box = rect;
+      }
+    }
+    node = node.parentElement;
+  }
+  return box;
+}
+
+function videosNearPoint(event) {
+  var found = pageVideos();
+  if (!document.elementsFromPoint) return found;
+  var stack = document.elementsFromPoint(event.clientX, event.clientY);
+  for (var i = 0; i < stack.length && i < 12; i++) {
+    var root = stack[i] && stack[i].shadowRoot;
+    if (!root || !root.querySelectorAll) continue;
+    var extra = root.querySelectorAll('video');
+    for (var j = 0; j < extra.length; j++) {
+      if (found.indexOf(extra[j]) === -1) found.push(extra[j]);
+    }
+  }
+  return found;
 }
 
 function onPipStageWheel(event) {
@@ -2790,3 +2860,5 @@ function installPipDrag(stage) {
     event.stopPropagation();
   }, true);
 }
+
+installPipWatcher();

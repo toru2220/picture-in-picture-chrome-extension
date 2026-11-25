@@ -211,13 +211,15 @@ function updateContentScripts(autoPip) {
   chrome.action.setTitle({title: `Automatic picture-in-picture (${autoPip ? "on" : "off"})`});
   chrome.action.setBadgeText({ text: autoPip ? "★" : "" });
   // Replace any previously registered script so a file-list change takes effect.
-  const removed = chrome.scripting.unregisterContentScripts({ ids: ["autoPip"] }).catch(() => {});
-  if (!autoPip) return;
+  // Wheel and shortcut controls run in every frame. Automatic PiP stays tied to
+  // the top document inside autoPip.js.
+  const removed = chrome.scripting.unregisterContentScripts({ ids: ["autoPip", "pipPage"] }).catch(() => {});
   removed.then(() => {
     chrome.scripting.registerContentScripts([{
-      id: "autoPip",
-      js: ["pip.js", "autoPip.js"],
+      id: autoPip ? "autoPip" : "pipPage",
+      js: autoPip ? ["pip.js", "autoPip.js"] : ["pip.js"],
       matches: ["<all_urls>"],
+      allFrames: true,
       runAt: "document_start"
     }]);
   });

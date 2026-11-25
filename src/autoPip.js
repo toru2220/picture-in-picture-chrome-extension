@@ -14,9 +14,9 @@
 
 installPipWatcher();
 
-// Request video to automatically enter picture-in-picture when eligible.
-// Another tab's tiled window stays as it is. A video that cannot move into
-// Document PiP closes every open PiP window and uses the browser's own PiP.
+// Automatic PiP stays on the top document. A frame only keeps the wheel and
+// shortcut controls, so an embedded advert cannot take the PiP window.
+if (isTopFrame()) {
 navigator.mediaSession.setActionHandler("enterpictureinpicture", async () => {
   const video = findLargestPlayingVideo();
   if (video && needsNativePip(video)) {
@@ -46,3 +46,4 @@ navigator.mediaSession.setActionHandler("enterpictureinpicture", async () => {
     }
   }
 });
+}
