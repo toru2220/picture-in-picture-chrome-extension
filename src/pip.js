@@ -37,8 +37,10 @@ var PIP_SPEED_FAST = 1.8;
 // Same yellow as the solid badge, at half opacity so the picture shows through.
 var PIP_SPEED_BADGE_BG = 'rgba(255,225,74,.5)';
 var PIP_SEEK_STEP = 10;
-// One mouse-wheel notch is about 100 pixels. That jumps five seconds.
+// One mouse-wheel notch is about 100 pixels. That jumps five seconds,
+// or five percent of volume when the pointer is over the picture.
 var PIP_WHEEL_SEEK_STEP = 5;
+var PIP_WHEEL_VOLUME_STEP = 0.05;
 var PIP_SPEED_KEYS = {
   KeyS: 'slower',
   KeyD: 'faster',
@@ -393,7 +395,7 @@ function defendPinnedVolume(source) {
     timers.push(setTimeout(function () {
       var session = pipState();
       if (session.volumeDefendTimers !== timers) return;
-      if (session.volumePinned && session.documentPipSource === source && !volumeMatches(source, session)) {
+      if (session.volumePinned && session.volumeSource === source && !volumeMatches(source, session)) {
         assignVolume(source);
         paintVolumeControls();
       }
@@ -704,7 +706,7 @@ function isHorizontalSeekBox(el) {
 }
 
 // Site players name this control differently. A wide, short bar is a seek
-// bar; a tall slider is volume and must keep scrolling.
+// bar. The rest of the picture uses the wheel for volume instead.
 function isSeekBarElement(el) {
   if (!el || !el.tagName) return false;
   var cls = typeof el.className === 'string' ? el.className : '';
@@ -773,14 +775,81 @@ function videoForSeekBar(bar) {
 function onPageSeekWheel(event) {
   if (!event || event.ctrlKey || event.metaKey) return;
   var bar = seekBarFromEvent(event);
-  if (!bar || (typeof bar.className === 'string' && bar.className.indexOf('pip-seekbar') !== -1)) return;
-  var video = videoForSeekBar(bar);
-  if (!video || !canSeek(video)) return;
-  var seconds = wheelSeekSeconds(event);
-  if (!seconds) return;
+  if (bar && (typeof bar.className !== 'string' || bar.className.indexOf('pip-seekbar') === -1)) {
+    var seekVideo = videoForSeekBar(bar);
+    if (!seekVideo || !canSeek(seekVideo)) return;
+    var seconds = wheelSeekSeconds(event);
+    if (!seconds) return;
+    event.preventDefault();
+    event.stopPropagation();
+    seekBy(seekVideo, seconds);
+    return;
+  }
+  var picture = videoUnderPointer(event);
+  if (!picture) return;
+  var delta = wheelVolumeDelta(event);
+  if (!delta) return;
   event.preventDefault();
   event.stopPropagation();
-  seekBy(video, seconds);
+  adjustVolumeBy(picture, delta);
+}
+
+// Wheel up, or a horizontal wheel to the right, raises the volume.
+function wheelVolumeDelta(event) {
+  if (!event) return 0;
+  var dx = event.deltaX || 0;
+  var dy = event.deltaY || 0;
+  var pixels = Math.abs(dx) > Math.abs(dy) ? dx : -dy;
+  if (event.deltaMode === 1) pixels *= 16;
+  else if (event.deltaMode === 2) pixels *= 800;
+  if (!pixels) return 0;
+  return pixels / 100 * PIP_WHEEL_VOLUME_STEP;
+}
+
+function clampVolume(value) {
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return Number(value.toFixed(2));
+}
+
+function adjustVolumeBy(video, delta) {
+  if (!video || !delta) return;
+  var state = pipState();
+  if (!state.volumePinned || state.volume == null) {
+    state.volume = video.muted ? 0 : (typeof video.volume === 'number' ? video.volume : 1);
+    state.muted = !!(video.muted || state.volume === 0);
+    if (video.volume > 0) state.lastAudible = video.volume;
+  }
+  var next = clampVolume((state.muted ? 0 : state.volume) + delta);
+  state.volume = next;
+  state.muted = next === 0;
+  state.volumePinned = true;
+  if (next > 0) state.lastAudible = next;
+  bindDocumentVolume(video);
+  writeVolume(video);
+}
+
+function videoUnderPointer(event) {
+  if (!event || event.clientX == null || event.clientY == null) return null;
+  var videos = pageVideos().filter(function (video) {
+    if (!video.isConnected || !video.getBoundingClientRect) return false;
+    var box = video.getBoundingClientRect();
+    if (box.width < 120 || box.height < 68) return false;
+    return event.clientX >= box.left && event.clientX <= box.right &&
+      event.clientY >= box.top && event.clientY <= box.bottom;
+  }).sort(function (a, b) { return videoArea(b) - videoArea(a); });
+  return videos[0] || null;
+}
+
+function onPipStageWheel(event) {
+  if (!event || event.ctrlKey || event.metaKey || seekBarFromEvent(event)) return;
+  var source = pipState().documentPipSource;
+  if (!source) return;
+  var delta = wheelVolumeDelta(event);
+  if (!delta) return;
+  event.preventDefault();
+  event.stopPropagation();
+  adjustVolumeBy(source, delta);
 }
 
 function setPipMark(video) {
@@ -936,7 +1005,7 @@ function bindDocumentVolume(source) {
   function reapplyPinned() {
     var session = pipState();
     if (session.applyingVolume || !session.volumePinned) return;
-    if (session.documentPipSource !== source) return;
+    if (session.volumeSource !== source) return;
     if (volumeMatches(source, session)) return;
     assignVolume(source);
     paintVolumeControls();
@@ -1367,6 +1436,7 @@ function buildDocumentPip(pipWindow) {
   seekBar.appendChild(seek);
   seekBar.appendChild(seekTime);
   seekBar.addEventListener('wheel', onSeekBarWheel, { capture: true, passive: false });
+  stage.addEventListener('wheel', onPipStageWheel, { capture: true, passive: false });
   stage.appendChild(bar);
   stage.appendChild(seekBar);
   stage.appendChild(speedLabel);
