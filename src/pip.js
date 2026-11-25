@@ -697,6 +697,92 @@ function onSeekBarWheel(event) {
   seekBy(source, seconds);
 }
 
+function isHorizontalSeekBox(el) {
+  if (!el || !el.getBoundingClientRect) return false;
+  var rect = el.getBoundingClientRect();
+  return rect.width >= 80 && rect.width > rect.height * 2;
+}
+
+// Site players name this control differently. A wide, short bar is a seek
+// bar; a tall slider is volume and must keep scrolling.
+function isSeekBarElement(el) {
+  if (!el || !el.tagName) return false;
+  var cls = typeof el.className === 'string' ? el.className : '';
+  if (cls.indexOf('pip-volume') !== -1 || cls.indexOf('pip-speed') !== -1 || cls.indexOf('pip-page-speed') !== -1) return false;
+  if (cls.indexOf('pip-seekbar') !== -1) return true;
+  if (el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'range') return isHorizontalSeekBox(el);
+  var label = '';
+  if (el.getAttribute) {
+    label = (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('aria-valuetext') || '');
+  }
+  var hint = cls + ' ' + (el.id || '') + ' ' + label;
+  if (/ytp-progress-bar|progress-bar|progressbar|seekbar|seek-bar|scrubber|timeline|シーク/i.test(hint)) {
+    return isHorizontalSeekBox(el);
+  }
+  var role = el.getAttribute && el.getAttribute('role');
+  if (role === 'slider' && /time|seek|progress|scrub|position|再生|シーク|経過/i.test(label)) {
+    return isHorizontalSeekBox(el);
+  }
+  if (el.tagName === 'PROGRESS') return isHorizontalSeekBox(el);
+  return false;
+}
+
+function seekBarFromEvent(event) {
+  var node = event && event.target;
+  if (node && node.nodeType && node.nodeType !== 1) node = node.parentElement;
+  for (var depth = 0; node && depth < 8; depth++) {
+    if (isSeekBarElement(node)) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function insideVideoPlayer(el) {
+  var node = el;
+  for (var depth = 0; node && depth < 12; depth++) {
+    var cls = typeof node.className === 'string' ? node.className : '';
+    if (/html5-video-player|video-player|ytd-player|player-container|jwplayer|vjs-|plyr|media-player/i.test(cls)) return true;
+    if (node.querySelector && node.querySelector('video')) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
+function videoNearSeekBar(bar) {
+  if (!bar || !bar.getBoundingClientRect) return null;
+  var rect = bar.getBoundingClientRect();
+  var videos = pageVideos().filter(function (video) {
+    if (!video.isConnected || !video.getBoundingClientRect) return false;
+    var box = video.getBoundingClientRect();
+    if (box.width < 80 || box.height < 45) return false;
+    var overlapsX = rect.right >= box.left - 8 && rect.left <= box.right + 8;
+    var overlapsY = rect.bottom >= box.top - 8 && rect.top <= box.bottom + 64;
+    return overlapsX && overlapsY;
+  }).sort(function (a, b) { return videoArea(b) - videoArea(a); });
+  return videos[0] || null;
+}
+
+function videoForSeekBar(bar) {
+  var nearby = videoNearSeekBar(bar);
+  if (nearby) return nearby;
+  var source = pipState().documentPipSource;
+  if (source && insideVideoPlayer(bar)) return source;
+  return null;
+}
+
+function onPageSeekWheel(event) {
+  if (!event || event.ctrlKey || event.metaKey) return;
+  var bar = seekBarFromEvent(event);
+  if (!bar || (typeof bar.className === 'string' && bar.className.indexOf('pip-seekbar') !== -1)) return;
+  var video = videoForSeekBar(bar);
+  if (!video || !canSeek(video)) return;
+  var seconds = wheelSeekSeconds(event);
+  if (!seconds) return;
+  event.preventDefault();
+  event.stopPropagation();
+  seekBy(video, seconds);
+}
+
 function setPipMark(video) {
   if (!video) return;
   video.__pipMark = video.currentTime;
@@ -1899,6 +1985,7 @@ function installPipWatcher() {
   if (state.installed) return;
   state.installed = true;
   document.addEventListener('keydown', onPipSpeedKey, true);
+  document.addEventListener('wheel', onPageSeekWheel, { capture: true, passive: false });
   window.addEventListener('scroll', placePageSpeedBadge, true);
   window.addEventListener('resize', placePageSpeedBadge);
   if (!state.pageSpeedTimer) state.pageSpeedTimer = setInterval(placePageSpeedBadge, 500);
