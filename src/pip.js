@@ -2698,12 +2698,13 @@ function unbindGuestKeepAlive() {
 }
 
 function applyGuestHide(video) {
-  if (!video || !video.style || !video.style.setProperty) return;
-  // Keep the element laid out and decoding. visibility:hidden makes some
-  // players detach the media, so the captured tile stays black.
-  video.style.setProperty('opacity', '0', 'important');
-  var pending = video.play && video.play();
-  if (pending && pending.catch) pending.catch(function () {});
+  if (!video) return;
+  // Leave the element visible. Hiding it makes the player a black box, and
+  // Chrome then stops producing frames while audio keeps going.
+  if (video.paused && video.play) {
+    var pending = video.play();
+    if (pending && pending.catch) pending.catch(function () {});
+  }
 }
 
 function hideGuestVideo(video) {
@@ -2744,6 +2745,21 @@ function guestCapture(video) {
   }
 }
 
+// The first captureStream() stays stuck on the previous media after a player
+// loads the next video. Audio still comes from the element, so only the
+// picture goes black. A new source, or a track that is no longer live, needs
+// another capture.
+function guestNeedsRecapture(state, video) {
+  if (!state || !video || video.readyState < 2) return false;
+  if (!(video.videoWidth > 0) || !(video.videoHeight > 0)) return false;
+  var src = video.currentSrc || '';
+  if (src && state.guestCapturedSrc && src !== state.guestCapturedSrc) return true;
+  if ((state.guestMediaGeneration || 0) !== (state.guestCapturedGeneration || 0)) return true;
+  var tracks = state.guestStream && state.guestStream.getVideoTracks && state.guestStream.getVideoTracks();
+  var track = tracks && tracks[0];
+  return !track || track.readyState === 'ended';
+}
+
 function startGuestTile(video) {
   var stream = guestCapture(video);
   if (!stream) return Promise.resolve(false);
@@ -2761,6 +2777,10 @@ function startGuestTile(video) {
     hideGuestVideo(video);
     bindGuestKeepAlive(video);
     bindGuestVolumeReport(video);
+    bindGuestRecapture(video);
+    state.guestCapturedSrc = video.currentSrc || '';
+    state.guestCapturedGeneration = state.guestMediaGeneration || 0;
+    watchGuestTrack(video, stream.getVideoTracks()[0]);
     reportGuestVolume();
     connectPipPort();
     watchPipSession();
@@ -2843,10 +2863,188 @@ function applyRemoteTileVolume(volume, muted) {
   defendPinnedVolume(video);
 }
 
+function bindGuestRecapture(video) {
+  var state = pipState();
+  if (state.guestRecaptureVideo && state.onGuestEmptied && state.guestRecaptureVideo.removeEventListener) {
+    state.guestRecaptureVideo.removeEventListener('emptied', state.onGuestEmptied);
+    state.guestRecaptureVideo.removeEventListener('loadeddata', state.onGuestLoaded);
+    state.guestRecaptureVideo.removeEventListener('playing', state.onGuestPlaying);
+  }
+  state.guestRecaptureVideo = video || null;
+  if (!video || !video.addEventListener) {
+    state.onGuestEmptied = null;
+    state.onGuestLoaded = null;
+    state.onGuestPlaying = null;
+    return;
+  }
+  state.onGuestEmptied = function () {
+    var session = pipState();
+    if (session.guestVideo !== video) return;
+    session.guestMediaGeneration = (session.guestMediaGeneration || 0) + 1;
+    scheduleGuestRecapture(video);
+  };
+  state.onGuestLoaded = function () {
+    if (pipState().guestVideo !== video) return;
+    scheduleGuestRecapture(video);
+  };
+  state.onGuestPlaying = function () {
+    if (pipState().guestVideo !== video) return;
+    scheduleGuestRecapture(video);
+  };
+  video.addEventListener('emptied', state.onGuestEmptied);
+  video.addEventListener('loadeddata', state.onGuestLoaded);
+  video.addEventListener('playing', state.onGuestPlaying);
+  if (!state.onGuestNavigate) {
+    state.onGuestNavigate = function () {
+      var session = pipState();
+      if (!session.guestActive || !session.guestVideo) return;
+      session.guestMediaGeneration = (session.guestMediaGeneration || 0) + 1;
+      scheduleGuestRecapture(session.guestVideo);
+    };
+    document.addEventListener('yt-navigate-finish', state.onGuestNavigate, true);
+    document.addEventListener('yt-page-data-updated', state.onGuestNavigate, true);
+  }
+}
+
+function scheduleGuestRecapture(video) {
+  var state = pipState();
+  if (state.guestRecaptureTimer) return;
+  state.guestRecaptureTimer = setTimeout(function () {
+    pipState().guestRecaptureTimer = 0;
+    refreshGuestCapture(video);
+  }, 200);
+}
+
+function watchGuestTrack(video, track) {
+  var state = pipState();
+  if (!track) return;
+  state.guestCaptureTrack = track;
+  if (!track.addEventListener) return;
+  track.addEventListener('unmute', function () {
+    pipState().guestSawFrame = true;
+  });
+  track.addEventListener('ended', function () {
+    var session = pipState();
+    if (session.guestVideo !== video) return;
+    session.guestMediaGeneration = (session.guestMediaGeneration || 0) + 1;
+    scheduleGuestRecapture(video);
+  });
+  // A capture that has already shown a picture and then goes quiet is the
+  // next video: the element keeps playing audio, but this track does not.
+  track.addEventListener('mute', function () {
+    if (!pipState().guestSawFrame) return;
+    setTimeout(function () {
+      var session = pipState();
+      if (session.guestCaptureTrack !== track || !track.muted) return;
+      if (session.guestVideo !== video || video.paused || !(video.videoWidth > 0)) return;
+      session.guestMediaGeneration = (session.guestMediaGeneration || 0) + 1;
+      refreshGuestCapture(video);
+    }, 300);
+  });
+}
+
+function replaceGuestSender(track, previous) {
+  var state = pipState();
+  var pc = state.guestPc;
+  var senders = pc && pc.getSenders && pc.getSenders();
+  var sender = senders && senders.filter(function (item) {
+    return !item.track || item.track.kind === 'video';
+  })[0];
+  if (!sender || !sender.replaceTrack) return;
+  Promise.resolve(sender.replaceTrack(track)).then(function () {
+    if (!previous || !previous.getVideoTracks) return;
+    previous.getVideoTracks().forEach(function (item) {
+      if (item !== track) item.stop();
+    });
+  }).catch(function () {});
+}
+
+function drawGuestFrames() {
+  var state = pipState();
+  if (!state.guestCanvasActive) {
+    state.guestDrawTimer = 0;
+    return;
+  }
+  var video = state.guestVideo;
+  if (video && state.guestCanvasCtx && video.readyState >= 2 && video.videoWidth > 0) {
+    try {
+      state.guestCanvasCtx.drawImage(video, 0, 0, state.guestCanvas.width, state.guestCanvas.height);
+    } catch (e) {}
+  }
+  state.guestDrawTimer = setTimeout(drawGuestFrames, 100);
+}
+
+function guestCanvasTrack() {
+  var state = pipState();
+  if (state.guestCanvasTrack && state.guestCanvasTrack.readyState === 'live') return state.guestCanvasTrack;
+  var canvas = document.createElement('canvas');
+  canvas.width = 1280;
+  canvas.height = 720;
+  canvas.setAttribute('__pip_proxy__', 'true');
+  var ctx = canvas.getContext && canvas.getContext('2d', { alpha: false });
+  if (!ctx || !canvas.captureStream) return null;
+  state.guestCanvas = canvas;
+  state.guestCanvasCtx = ctx;
+  state.guestCanvasTrack = canvas.captureStream(30).getVideoTracks()[0];
+  state.guestCanvasActive = true;
+  if (!state.guestDrawTimer) drawGuestFrames();
+  return state.guestCanvasTrack;
+}
+
+function refreshGuestCapture(video) {
+  var state = pipState();
+  if (!state.guestActive || state.guestVideo !== video) return;
+  if (state.guestUsingCanvas) return;
+  if (!guestNeedsRecapture(state, video)) return;
+  var previous = state.guestStream;
+  var stream = guestCapture(video);
+  if (previous && stream === previous) {
+    previous.getVideoTracks().forEach(function (item) { item.stop(); });
+    stream = guestCapture(video);
+  }
+  var track = stream && stream.getVideoTracks()[0];
+  // The element will not hand out a new capture after the first one dies.
+  // Keep copying its current frame instead, so the next video still appears.
+  if (!track || track.readyState === 'ended' || stream === previous) {
+    var canvasTrack = guestCanvasTrack();
+    if (!canvasTrack) return;
+    state.guestUsingCanvas = true;
+    state.guestCapturedSrc = video.currentSrc || '';
+    state.guestCapturedGeneration = state.guestMediaGeneration || 0;
+    replaceGuestSender(canvasTrack, previous);
+    return;
+  }
+  state.guestStream = stream;
+  state.guestCapturedSrc = video.currentSrc || '';
+  state.guestCapturedGeneration = state.guestMediaGeneration || 0;
+  watchGuestTrack(video, track);
+  replaceGuestSender(track, previous);
+}
+
 function stopGuestCapture(pause) {
   var state = pipState();
   unbindGuestKeepAlive();
   bindGuestVolumeReport(null);
+  bindGuestRecapture(null);
+  if (state.guestRecaptureTimer) {
+    clearTimeout(state.guestRecaptureTimer);
+    state.guestRecaptureTimer = 0;
+  }
+  state.guestCanvasActive = false;
+  state.guestUsingCanvas = false;
+  if (state.guestDrawTimer) {
+    clearTimeout(state.guestDrawTimer);
+    state.guestDrawTimer = 0;
+  }
+  if (state.guestCanvasTrack) {
+    try { state.guestCanvasTrack.stop(); } catch (e) {}
+    state.guestCanvasTrack = null;
+  }
+  if (state.onGuestNavigate) {
+    document.removeEventListener('yt-navigate-finish', state.onGuestNavigate, true);
+    document.removeEventListener('yt-page-data-updated', state.onGuestNavigate, true);
+    state.onGuestNavigate = null;
+  }
   if (state.guestPc) {
     try { state.guestPc.close(); } catch (e) {}
     state.guestPc = null;
@@ -2874,26 +3072,16 @@ function stopGuestTile(silent) {
 
 function retargetGuest(video) {
   var state = pipState();
-  var stream = guestCapture(video);
-  if (!stream) return;
-  var track = stream.getVideoTracks()[0];
-  var previous = state.guestStream;
+  if (!video || video === state.guestVideo) return;
   restoreGuestVideo(true);
   hideGuestVideo(video);
-  state.guestStream = stream;
   state.guestVideo = video;
+  state.guestMediaGeneration = (state.guestMediaGeneration || 0) + 1;
   holdSpeed(video);
-  var pc = state.guestPc;
-  var sender = pc && pc.getSenders && pc.getSenders().filter(function (item) {
-    return item.track && item.track.kind === 'video';
-  })[0];
-  var replaced = sender && sender.replaceTrack ? sender.replaceTrack(track) : null;
-  Promise.resolve(replaced).then(function () {
-    if (!previous) return;
-    previous.getVideoTracks().forEach(function (item) {
-      if (item !== track) item.stop();
-    });
-  }).catch(function () {});
+  bindGuestKeepAlive(video);
+  bindGuestVolumeReport(video);
+  bindGuestRecapture(video);
+  refreshGuestCapture(video);
 }
 
 function updateGuestTile() {
@@ -2906,6 +3094,8 @@ function updateGuestTile() {
     if (pending && pending.catch) pending.catch(function () {});
   }
   watchPipSession();
+  var src = logical.currentSrc || '';
+  if (src && state.guestCapturedSrc && src !== state.guestCapturedSrc) scheduleGuestRecapture(logical);
   var live = isCurrentLive(logical);
   var candidate = findReplacementVideo(logical, live);
   var target = candidate && shouldSwitchPipVideo(logical, candidate, live) ? candidate : logical;
