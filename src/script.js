@@ -41,6 +41,14 @@
       return;
     }
     if (status && status.hostTabId != null) return;
+    // This click also runs in the top frame, which opens Document PiP. A
+    // native PiP from here would close that window as soon as it appears.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const again = await pipSend({ type: 'pip-status' });
+    if (again && again.hostTabId != null) {
+      if (!again.isHost) await startGuestTile(video);
+      return;
+    }
     await requestPictureInPicture(video);
     return;
   }

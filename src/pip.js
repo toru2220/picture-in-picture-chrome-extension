@@ -1635,6 +1635,7 @@ function openDocumentPip(video) {
   }
   var aspect = videoAspect(video) || (16 / 9);
   var size = pipWindowSize(aspect);
+  pipState().openingDocumentPip = true;
   return api.requestWindow({ width: size.width, height: size.height }).then(function (pipWindow) {
     var state = pipState();
     if (!state.lockedAspect) state.lockedAspect = aspect;
@@ -1651,6 +1652,8 @@ function openDocumentPip(video) {
     watchPipSession();
     flushPendingGuests();
     pipSend({ type: 'pip-remember-window' });
+  }).finally(function () {
+    pipState().openingDocumentPip = false;
   });
 }
 
@@ -2333,7 +2336,11 @@ function installPipMessenger() {
 function onPipRuntimeMessage(message, sender, sendResponse) {
   if (!message || !message.type) return;
   if (message.type === 'pip-host-check') {
-    var open = !!documentPipWindow();
+    var checked = pipState();
+    // The claim lands before requestWindow resolves. Reporting that gap as
+    // closed made another frame drop the host and close the new window.
+    var open = !!documentPipWindow() || !!checked.documentPipOwned ||
+      !!checked.hostClaimed || !!checked.openingDocumentPip;
     if (open) connectPipPort();
     sendResponse({ open: open });
     return;
@@ -2359,6 +2366,8 @@ function onPipRuntimeMessage(message, sender, sendResponse) {
   else if (message.type === 'pip-host-released') {
     var session = pipState();
     if (session.openingNative || session.nativeOnly) return;
+    if (!message.force && (session.openingDocumentPip || session.hostClaimed ||
+        session.documentPipOwned || documentPipWindow())) return;
     exitExtensionPip();
   }
 }

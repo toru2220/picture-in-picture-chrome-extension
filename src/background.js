@@ -53,6 +53,11 @@ chrome.contextMenus.onClicked.addListener(({ checked: autoPip }) => {
 let pipHost = null;
 let pipWindowId = null;
 let nativeTakeoverUntil = 0;
+// Claim returns before requestWindow paints. A status check in that gap used
+// to treat the missing window as "closed" and tell the opener to exit, so the
+// window flashed and disappeared.
+let hostClaimedAt = 0;
+const HOST_OPEN_GRACE_MS = 2500;
 const pipGuests = new Map();
 const PARTICIPANTS_KEY = "pipParticipants";
 let participantsEpoch = 0;
@@ -106,16 +111,23 @@ function ensureParticipants() {
   return participantsReady;
 }
 
-function clearHost(skipTabId) {
+function clearHost(skipTabId, force) {
   const host = pipHost;
   const guests = Array.from(pipGuests.values());
   pipHost = null;
   pipWindowId = null;
+  hostClaimedAt = 0;
   pipGuests.clear();
   clearStoredParticipants();
   guests.forEach((guest) => sendTo(guest, { type: "pip-host-gone" }));
   if (!host || host.tabId === skipTabId) return;
-  sendTo(host, { type: "pip-host-released" });
+  sendTo(host, { type: "pip-host-released", force: !!force });
+}
+
+function hostInOpenGrace(host) {
+  return !!(host && pipHost &&
+    pipHost.tabId === host.tabId && pipHost.frameId === host.frameId &&
+    hostClaimedAt && Date.now() - hostClaimedAt < HOST_OPEN_GRACE_MS);
 }
 
 function dropGuest(tabId, silentGuest) {
@@ -134,7 +146,10 @@ function hostStillOpen(host) {
   if (!host || host.tabId == null) return Promise.resolve(false);
   return chrome.tabs.get(host.tabId).then(() => {
     return chrome.tabs.sendMessage(host.tabId, { type: "pip-host-check" }, { frameId: host.frameId })
-      .then((response) => !(response && response.open === false))
+      .then((response) => {
+        if (response && response.open === false) return hostInOpenGrace(host);
+        return true;
+      })
       .catch(() => true);
   }).catch(() => false);
 }
@@ -193,7 +208,7 @@ async function handlePipMessage(message, tabId, frameId) {
   }
   if (message.type === "pip-exit-all") {
     nativeTakeoverUntil = Date.now() + 2000;
-    clearHost(tabId);
+    clearHost(tabId, true);
     return { ok: true };
   }
   if (message.type === "pip-claim-host") {
@@ -211,6 +226,7 @@ async function handlePipMessage(message, tabId, frameId) {
       clearHost();
     }
     pipHost = { tabId, frameId };
+    hostClaimedAt = Date.now();
     await persistParticipants();
     return { ok: true, hostTabId: tabId };
   }
