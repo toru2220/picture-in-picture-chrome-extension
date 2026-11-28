@@ -137,6 +137,7 @@ function pipState() {
     pipGrid: null,
     pipHostTile: null,
     hostClaimed: false,
+    hostAssertedAt: 0,
     documentPipOwned: false,
     pipPort: null,
     messenger: false,
@@ -1425,6 +1426,7 @@ function buildDocumentPip(pipWindow) {
   state.pipGrid = grid;
   state.pipHostTile = hostTile;
   layoutPipGrid();
+  pipWindow.addEventListener('resize', layoutPipGrid);
   state.volumeSlider = slider;
   state.volumeMute = mute;
   state.playButton = play;
@@ -1941,6 +1943,7 @@ function updatePipVideo() {
     endPipSession();
     return;
   }
+  if (docPip && state.documentPipOwned) reassertPipHost();
   if (performance.now() < state.suppressUntil) return;
   watchPipSession();
   var logical = docPip
@@ -2087,6 +2090,9 @@ function installPipWatcher() {
 
 function pipGridColumns(count) {
   if (count <= 1) return 1;
+  var win = documentPipWindow();
+  // A portrait window stacks tiles in one column. A wide window keeps a row.
+  if (win && win.innerHeight > win.innerWidth) return 1;
   if (count <= 4) return 2;
   return 3;
 }
@@ -2189,11 +2195,34 @@ function connectPipPort() {
   if (state.pipPort) return;
   if (!globalThis.chrome || !chrome.runtime || !chrome.runtime.connect) return;
   try {
-    state.pipPort = chrome.runtime.connect({ name: 'pip-participant' });
-    state.pipPort.onDisconnect.addListener(function () {
-      pipState().pipPort = null;
+    var port = chrome.runtime.connect({ name: 'pip-participant' });
+    state.pipPort = port;
+    port.onDisconnect.addListener(function () {
+      var current = pipState();
+      if (current.pipPort === port) current.pipPort = null;
+      // Stopping the service worker drops this port while the window is
+      // still open. Reconnect so the next idle shutdown can be told apart
+      // from the tab actually going away.
+      setTimeout(function () {
+        var session = pipState();
+        if (session.pipPort) return;
+        if (session.documentPipOwned && documentPipWindow()) connectPipPort();
+        else if (session.guestActive) connectPipPort();
+      }, 400);
     });
   } catch (e) {}
+}
+
+function reassertPipHost() {
+  var state = pipState();
+  if (!state.documentPipOwned || !documentPipWindow()) return;
+  var now = Date.now();
+  if (state.hostAssertedAt && now - state.hostAssertedAt < 15000) return;
+  state.hostAssertedAt = now;
+  connectPipPort();
+  pipSend({ type: 'pip-host-heartbeat' }).then(function (response) {
+    if (response && response.ok) pipState().hostClaimed = true;
+  });
 }
 
 function disconnectPipPort() {
@@ -2227,8 +2256,20 @@ function installPipMessenger() {
   chrome.runtime.onMessage.addListener(onPipRuntimeMessage);
 }
 
-function onPipRuntimeMessage(message) {
+function onPipRuntimeMessage(message, sender, sendResponse) {
   if (!message || !message.type) return;
+  if (message.type === 'pip-host-check') {
+    var open = !!documentPipWindow();
+    if (open) connectPipPort();
+    sendResponse({ open: open });
+    return;
+  }
+  if (message.type === 'pip-guest-check') {
+    var active = !!pipState().guestActive;
+    if (active) connectPipPort();
+    sendResponse({ active: active });
+    return;
+  }
   if (message.type === 'pip-add') acceptGuestOffer(message);
   else if (message.type === 'pip-signal') {
     if (message.fromTabId != null) acceptHostSignal(message);
