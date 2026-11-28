@@ -265,6 +265,27 @@ async function handlePipMessage(message, tabId, frameId) {
     }
     return { ok: true };
   }
+  if (message.type === "pip-tile-volume") {
+    if (pipHost && tabId === pipHost.tabId) {
+      const guest = pipGuests.get(message.tabId);
+      if (guest) {
+        sendTo(guest, {
+          type: "pip-tile-volume",
+          volume: message.volume,
+          muted: !!message.muted,
+        });
+      }
+    } else if (pipHost && pipGuests.has(tabId)) {
+      sendTo(pipHost, {
+        type: "pip-tile-volume",
+        fromTabId: tabId,
+        volume: message.volume,
+        muted: !!message.muted,
+        report: true,
+      });
+    }
+    return { ok: true };
+  }
   if (message.type === "pip-drop-guest") {
     dropGuest(message.tabId != null ? message.tabId : tabId);
     return { ok: true };

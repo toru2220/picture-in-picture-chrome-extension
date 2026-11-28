@@ -322,16 +322,37 @@ function pipWindowSize(aspect) {
   return { width: Math.max(1, Math.round(longSide * aspect)), height: longSide };
 }
 
+function paintTileVolume(slider, mute, volume, muted) {
+  if (slider) slider.value = String(muted ? 0 : (volume == null ? 1 : volume));
+  if (!mute) return;
+  var silent = !!muted || !(volume > 0);
+  mute.innerHTML = silent ? PIP_ICON_OFF : PIP_ICON_ON;
+  mute.setAttribute('aria-label', silent ? 'Unmute' : 'Mute');
+}
+
 function paintVolumeControls() {
   var state = pipState();
-  if (state.volumeSlider) {
-    var shown = state.muted ? 0 : state.volume;
-    state.volumeSlider.value = String(shown == null ? 1 : shown);
-  }
-  if (!state.volumeMute) return;
-  var silent = !!state.muted || !(state.volume > 0);
-  state.volumeMute.innerHTML = silent ? PIP_ICON_OFF : PIP_ICON_ON;
-  state.volumeMute.setAttribute('aria-label', silent ? 'Unmute' : 'Mute');
+  paintTileVolume(state.volumeSlider, state.volumeMute, state.volume, state.muted);
+}
+
+function createTileVolume(doc) {
+  var bar = doc.createElement('div');
+  bar.className = 'pip-volume';
+  var mute = doc.createElement('button');
+  mute.type = 'button';
+  mute.className = 'pip-mute';
+  var slider = doc.createElement('input');
+  slider.type = 'range';
+  slider.className = 'pip-volume-slider';
+  slider.min = '0';
+  slider.max = '1';
+  slider.step = '0.01';
+  slider.value = '1';
+  slider.setAttribute('aria-label', 'Volume');
+  slider.setAttribute('orient', 'vertical');
+  bar.appendChild(slider);
+  bar.appendChild(mute);
+  return { bar: bar, slider: slider, mute: mute };
 }
 
 function readVolume(source) {
@@ -1068,23 +1089,16 @@ function watchDocumentPipFit(source) {
   fitDocumentPipVideo(source);
 }
 
-var PIP_FIT_PROPS = [
-  'position', 'inset', 'left', 'top', 'right', 'bottom',
-  'width', 'height', 'max-width', 'max-height', 'min-width', 'min-height',
-  'margin', 'object-fit', 'object-position', 'aspect-ratio', 'transform'
-];
-
-function clearFitStyles(video) {
-  if (!video || !video.style || !video.style.removeProperty) return;
-  for (var i = 0; i < PIP_FIT_PROPS.length; i++) {
-    video.style.removeProperty(PIP_FIT_PROPS[i]);
-  }
-}
-
 function applyParkedPresentation(video, parked) {
   if (!video) return;
-  clearFitStyles(video);
-  if (video.style) video.style.cssText = parked.cssText || '';
+  // Drop the PiP overrides completely, including ones marked important.
+  // Assigning cssText alone can leave those behind, and the page then
+  // clips the frame inside overflow:hidden.
+  if (video.style) {
+    video.style.cssText = '';
+    if (video.removeAttribute) video.removeAttribute('style');
+    if (parked.cssText) video.style.cssText = parked.cssText;
+  }
   if (!video.setAttribute) return;
   if (parked.widthAttr == null) video.removeAttribute('width');
   else video.setAttribute('width', parked.widthAttr);
@@ -1154,16 +1168,85 @@ function layoutShrunk(video, parked) {
   return false;
 }
 
-function fillVideoToParent(video) {
-  var parent = video.parentElement;
+function videoFrameCutOff(video) {
+  if (!video || !video.isConnected || video.ownerDocument !== document) return false;
+  if (!video.getBoundingClientRect) return false;
+  var rect = video.getBoundingClientRect();
+  if (rect.width < 8 || rect.height < 8) return false;
+  var node = video.parentElement;
+  var depth = 0;
+  while (node && depth < 6 && node !== document.body && node !== document.documentElement) {
+    var clips = false;
+    try {
+      var style = getComputedStyle(node);
+      var overflow = (style.overflow || '') + (style.overflowX || '') + (style.overflowY || '');
+      clips = overflow.indexOf('hidden') !== -1 || overflow.indexOf('clip') !== -1;
+    } catch (e) {}
+    if (clips && node.getBoundingClientRect) {
+      var host = node.getBoundingClientRect();
+      if (rect.left < host.left - 2 || rect.top < host.top - 2 ||
+          rect.right > host.right + 2 || rect.bottom > host.bottom + 2) return true;
+    }
+    node = node.parentElement;
+    depth++;
+  }
+  if (!(video.videoWidth > 0) || !(video.videoHeight > 0)) return false;
+  var shown = rect.width / rect.height;
+  var intrinsic = video.videoWidth / video.videoHeight;
+  if (Math.abs(shown - intrinsic) / intrinsic <= 0.08) return false;
+  var fit = '';
+  try { fit = getComputedStyle(video).objectFit || ''; } catch (e) {}
+  if (fit === 'contain' || fit === 'scale-down') return false;
+  return true;
+}
+
+// Size the returned element to its own frame inside the player. Stretching it
+// to the parent box, or leaving a cover fit, cuts off the picture.
+function fitReturnedVideo(video) {
+  var parent = video && video.parentElement;
   if (!parent || !video.style) return;
-  var width = parent.clientWidth;
-  var height = parent.clientHeight;
-  if (width < 160 || height < 90) return;
-  video.style.setProperty('width', Math.round(width) + 'px');
-  video.style.setProperty('height', Math.round(height) + 'px');
-  video.style.removeProperty('max-width');
-  video.style.removeProperty('max-height');
+  var pw = parent.clientWidth;
+  var ph = parent.clientHeight;
+  if (pw < 160 || ph < 90) return;
+  var style = video.style;
+  style.removeProperty('inset');
+  style.removeProperty('right');
+  style.removeProperty('bottom');
+  style.setProperty('max-width', '100%');
+  style.setProperty('max-height', '100%');
+  style.setProperty('object-fit', 'contain');
+  style.setProperty('object-position', 'center');
+  style.setProperty('transform', 'none');
+  var aspect = video.videoWidth > 0 && video.videoHeight > 0 ? video.videoWidth / video.videoHeight : 0;
+  if (!aspect) {
+    style.setProperty('width', '100%');
+    style.setProperty('height', '100%');
+    return;
+  }
+  var width = pw;
+  var height = width / aspect;
+  if (height > ph) {
+    height = ph;
+    width = height * aspect;
+  }
+  width = Math.max(1, Math.round(width));
+  height = Math.max(1, Math.round(height));
+  style.setProperty('width', width + 'px');
+  style.setProperty('height', height + 'px');
+  var positioned = false;
+  try {
+    var pos = getComputedStyle(parent).position;
+    positioned = !!pos && pos !== 'static';
+  } catch (e) {}
+  if (positioned) {
+    style.setProperty('position', 'absolute');
+    style.setProperty('left', Math.max(0, Math.round((pw - width) / 2)) + 'px');
+    style.setProperty('top', Math.max(0, Math.round((ph - height) / 2)) + 'px');
+  }
+}
+
+function returnedVideoNeedsRepair(video, parked) {
+  return layoutShrunk(video, parked) || videoFrameCutOff(video);
 }
 
 function nudgePlayerLayout() {
@@ -1184,7 +1267,7 @@ function reapplyParkedLayout(parked) {
     }
   }
   nudgePlayerLayout();
-  if (layoutShrunk(video, parked)) fillVideoToParent(video);
+  if (returnedVideoNeedsRepair(video, parked)) fitReturnedVideo(video);
 }
 
 function scheduleLayoutRestore(parked) {
@@ -1195,7 +1278,7 @@ function scheduleLayoutRestore(parked) {
   parked.timers = [];
   delays.forEach(function (delay) {
     parked.timers.push(setTimeout(function () {
-      if (!layoutShrunk(parked.video, parked)) return;
+      if (!returnedVideoNeedsRepair(parked.video, parked)) return;
       reapplyParkedLayout(parked);
     }, delay));
   });
@@ -1207,7 +1290,9 @@ function restoreParkedVideo(pause) {
   if (!parked || !parked.video) return;
   stopDocumentPipFit();
   var video = parked.video;
-  applyParkedPresentation(video, parked);
+  // Leave the PiP document before restoring style. Its stylesheet still
+  // forces the element to the window, which clips the frame once it is back
+  // on the page.
   var parent = parked.parent;
   if (parent && parent.isConnected) {
     if (parked.next && parked.next.parentNode === parent) parent.insertBefore(video, parked.next);
@@ -1215,6 +1300,7 @@ function restoreParkedVideo(pause) {
   } else if (document.body) {
     document.body.appendChild(video);
   }
+  applyParkedPresentation(video, parked);
   // Drop the size lock only after the video is back, so the player cannot
   // collapse around the empty slot and keep that smaller box.
   releaseLayoutHolds(parked);
@@ -1329,7 +1415,7 @@ function buildDocumentPip(pipWindow) {
     '.pip-volume{position:absolute;z-index:3;top:8px;right:8px;bottom:46px;display:flex;flex-direction:column;',
     'align-items:center;justify-content:flex-end;gap:6px;padding:8px 4px;border-radius:8px;background:rgba(0,0,0,.45)}',
     '.pip-volume-slider{-webkit-appearance:slider-vertical;appearance:slider-vertical;',
-    'width:22px;height:100%;min-height:80px;margin:0;accent-color:#fff}',
+    'width:22px;height:100%;min-height:0;margin:0;accent-color:#fff}',
     '.pip-seekbar{position:absolute;z-index:3;left:0;right:0;bottom:0;display:flex;align-items:center;gap:8px;',
     'padding:8px 10px 10px;background:linear-gradient(transparent,rgba(0,0,0,.75))}',
     '.pip-seekbar[hidden]{display:none}',
@@ -1339,11 +1425,12 @@ function buildDocumentPip(pipWindow) {
     'border-radius:8px;padding:6px 10px;background:' + PIP_SPEED_BADGE_BG + ';color:#1a1a1a;',
     '-webkit-appearance:none;appearance:none;',
     'font:700 22px/1 system-ui,sans-serif;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.45)}',
-    '.pip-volume,.pip-seekbar,.pip-tile-close{opacity:1;transition:opacity .15s ease}',
-    '.pip-stage.pip-controls-hidden .pip-volume,.pip-stage.pip-controls-hidden .pip-volume *,',
+    '.pip-seekbar,.pip-tile-close{opacity:1;transition:opacity .15s ease}',
+    '.pip-tile .pip-volume{opacity:0;pointer-events:none;transition:opacity .15s ease}',
+    '.pip-tile:hover .pip-volume{opacity:1;pointer-events:auto}',
     '.pip-stage.pip-controls-hidden .pip-seekbar,.pip-stage.pip-controls-hidden .pip-seekbar *,',
     '.pip-stage.pip-controls-hidden .pip-tile-close{opacity:0;pointer-events:none}',
-    '.pip-stage.pip-controls-flash .pip-volume,.pip-stage.pip-controls-flash .pip-seekbar,',
+    '.pip-stage.pip-controls-flash .pip-seekbar,',
     '.pip-stage.pip-controls-flash .pip-tile-close{opacity:1;pointer-events:auto}',
     '.pip-volume,.pip-volume *,.pip-seekbar,.pip-seekbar *,.pip-tile-close{cursor:pointer}',
     '.pip-mute{width:28px;height:28px;flex:none;border:0;padding:0;background:transparent;color:#fff;cursor:pointer}'
@@ -1362,22 +1449,10 @@ function buildDocumentPip(pipWindow) {
   hostTile.className = 'pip-tile';
   grid.appendChild(hostTile);
   stage.appendChild(grid);
-  var bar = doc.createElement('div');
-  bar.className = 'pip-volume';
-  var mute = doc.createElement('button');
-  mute.type = 'button';
-  mute.className = 'pip-mute';
-  var slider = doc.createElement('input');
-  slider.type = 'range';
-  slider.className = 'pip-volume-slider';
-  slider.min = '0';
-  slider.max = '1';
-  slider.step = '0.01';
-  slider.value = '1';
-  slider.setAttribute('aria-label', 'Volume');
-  slider.setAttribute('orient', 'vertical');
-  bar.appendChild(slider);
-  bar.appendChild(mute);
+  var hostVolume = createTileVolume(doc);
+  hostTile.appendChild(hostVolume.bar);
+  var slider = hostVolume.slider;
+  var mute = hostVolume.mute;
   var seekBar = doc.createElement('div');
   seekBar.className = 'pip-seekbar';
   var play = doc.createElement('button');
@@ -1416,7 +1491,6 @@ function buildDocumentPip(pipWindow) {
   seekBar.appendChild(seek);
   seekBar.appendChild(seekTime);
   seekBar.addEventListener('wheel', onSeekBarWheel, { capture: true, passive: false });
-  stage.appendChild(bar);
   stage.appendChild(seekBar);
   stage.appendChild(speedLabel);
   doc.body.appendChild(stage);
@@ -2270,6 +2344,11 @@ function onPipRuntimeMessage(message, sender, sendResponse) {
     sendResponse({ active: active });
     return;
   }
+  if (message.type === 'pip-tile-volume') {
+    if (message.fromTabId != null) rememberGuestVolume(message.fromTabId, message.volume, message.muted);
+    else applyRemoteTileVolume(message.volume, message.muted);
+    return;
+  }
   if (message.type === 'pip-add') acceptGuestOffer(message);
   else if (message.type === 'pip-signal') {
     if (message.fromTabId != null) acceptHostSignal(message);
@@ -2387,6 +2466,53 @@ function remoteStreamFromTrack(event) {
   return stream;
 }
 
+function rememberGuestVolume(tabId, volume, muted) {
+  if (tabId == null) return;
+  var state = pipState();
+  var level = Number(volume);
+  if (!isFinite(level)) level = 1;
+  var silent = !!muted || !(level > 0);
+  state.guestLevels = state.guestLevels || {};
+  state.guestLevels[String(tabId)] = { volume: level, muted: silent };
+  var peer = state.guestPeers && state.guestPeers[String(tabId)];
+  if (!peer) return;
+  peer.volume = level;
+  peer.muted = silent;
+  if (level > 0) peer.lastAudible = level;
+  paintTileVolume(peer.slider, peer.mute, peer.volume, peer.muted);
+}
+
+function bindGuestTileVolume(tabId, controls) {
+  var state = pipState();
+  var peer = state.guestPeers && state.guestPeers[String(tabId)];
+  if (!peer || !controls) return;
+  var saved = state.guestLevels && state.guestLevels[String(tabId)];
+  peer.slider = controls.slider;
+  peer.mute = controls.mute;
+  peer.volume = saved ? saved.volume : 1;
+  peer.muted = saved ? saved.muted : false;
+  peer.lastAudible = peer.volume > 0 ? peer.volume : 1;
+  paintTileVolume(peer.slider, peer.mute, peer.volume, peer.muted);
+  controls.slider.addEventListener('input', function () {
+    var current = pipState().guestPeers && pipState().guestPeers[String(tabId)];
+    if (!current) return;
+    var value = Number(controls.slider.value);
+    current.volume = value;
+    current.muted = value === 0;
+    if (value > 0) current.lastAudible = value;
+    paintTileVolume(current.slider, current.mute, current.volume, current.muted);
+    pipSend({ type: 'pip-tile-volume', tabId: tabId, volume: current.volume, muted: current.muted });
+  });
+  controls.mute.addEventListener('click', function () {
+    var current = pipState().guestPeers && pipState().guestPeers[String(tabId)];
+    if (!current) return;
+    current.muted = !current.muted;
+    if (!current.muted && !(current.volume > 0)) current.volume = current.lastAudible || 1;
+    paintTileVolume(current.slider, current.mute, current.volume, current.muted);
+    pipSend({ type: 'pip-tile-volume', tabId: tabId, volume: current.volume, muted: current.muted });
+  });
+}
+
 function playMuted(video) {
   if (!video) return;
   video.muted = true;
@@ -2435,6 +2561,9 @@ function mountGuestTile(tabId, stream) {
   });
   tile.appendChild(close);
   tile.appendChild(video);
+  var volume = createTileVolume(doc);
+  tile.appendChild(volume.bar);
+  bindGuestTileVolume(tabId, volume);
   grid.appendChild(tile);
   if (video.style) video.style.cssText = '';
   video.srcObject = stream;
@@ -2622,6 +2751,8 @@ function startGuestTile(video) {
     state.guestStream = stream;
     hideGuestVideo(video);
     bindGuestKeepAlive(video);
+    bindGuestVolumeReport(video);
+    reportGuestVolume();
     connectPipPort();
     watchPipSession();
     var pc = pipPeerConnection();
@@ -2659,9 +2790,54 @@ function startGuestTile(video) {
   });
 }
 
+function reportGuestVolume() {
+  var state = pipState();
+  var video = state.guestVideo;
+  if (!state.guestActive || !video || state.applyingVolume) return;
+  pipSend({
+    type: 'pip-tile-volume',
+    volume: video.volume,
+    muted: !!video.muted || video.volume === 0,
+    report: true
+  });
+}
+
+function bindGuestVolumeReport(video) {
+  var state = pipState();
+  if (state.guestVolumeVideo && state.onGuestVolume && state.guestVolumeVideo.removeEventListener) {
+    state.guestVolumeVideo.removeEventListener('volumechange', state.onGuestVolume);
+  }
+  state.guestVolumeVideo = video;
+  if (!video || !video.addEventListener) {
+    state.onGuestVolume = null;
+    return;
+  }
+  state.onGuestVolume = function () {
+    if (pipState().applyingVolume) return;
+    reportGuestVolume();
+  };
+  video.addEventListener('volumechange', state.onGuestVolume);
+}
+
+function applyRemoteTileVolume(volume, muted) {
+  var video = pipState().guestVideo;
+  if (!video) return;
+  var session = pipState();
+  var level = Number(volume);
+  if (!isFinite(level)) level = 1;
+  session.volume = level;
+  session.muted = !!muted || !(level > 0);
+  session.volumePinned = true;
+  if (level > 0) session.lastAudible = level;
+  session.volumeSource = video;
+  assignVolume(video);
+  defendPinnedVolume(video);
+}
+
 function stopGuestCapture(pause) {
   var state = pipState();
   unbindGuestKeepAlive();
+  bindGuestVolumeReport(null);
   if (state.guestPc) {
     try { state.guestPc.close(); } catch (e) {}
     state.guestPc = null;
